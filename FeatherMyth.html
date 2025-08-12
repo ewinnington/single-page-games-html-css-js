@@ -85,6 +85,315 @@
   const ROOM={ START:1, GREY:2, THRONE:3 };
   let room = ROOM.START;
 
+  // Enemy System
+  class Enemy {
+    constructor(x, y, type) {
+      this.x = x;
+      this.y = y;
+      this.type = type;
+      this.alive = true;
+      this.frozen = 0;
+      this.flash = 0;
+      this.id = Math.random(); // Unique ID for tracking hits
+    }
+
+    dispatch(event, data = {}) {
+      switch(event) {
+        case 'update': return this.update(data.dt);
+        case 'draw': return this.draw(data.ctx);
+        case 'damage': return this.takeDamage(data.amount, data.source);
+        case 'freeze': return this.freeze(data.duration);
+        case 'collide': return this.checkCollision(data.box);
+        case 'pointHit': return this.checkPointHit(data.x, data.y);
+        case 'death': return this.onDeath(data.room);
+      }
+    }
+
+    update(dt) {
+      if (!this.alive) return;
+      if (this.frozen > 0) { this.frozen--; return; }
+      if (this.flash > 0) this.flash--;
+    }
+
+    draw(ctx) {
+      if (!this.alive) return;
+    }
+
+    takeDamage(amount, source) {
+      if (!this.alive) return false;
+      this.hp -= amount;
+      this.flash = 10;
+      if (this.hp <= 0) {
+        this.alive = false;
+        return true; // died
+      }
+      return false; // still alive
+    }
+
+    freeze(duration) {
+      this.frozen = duration;
+      this.flash = 10;
+    }
+
+    checkCollision(box) {
+      return AABB(box, this);
+    }
+
+    checkPointHit(x, y) {
+      return x >= this.x && x <= this.x + this.w && y >= this.y && y <= this.y + this.h;
+    }
+
+    onDeath(room) {
+      dropRupee(room, this.x + this.w/2, this.y + this.h/2);
+    }
+
+    getHitbox() {
+      return {x: this.x, y: this.y, w: this.w, h: this.h};
+    }
+
+    getCenter() {
+      return {x: this.x + this.w/2, y: this.y + this.h/2};
+    }
+  }
+
+  class Bat extends Enemy {
+    constructor(x, y) {
+      super(x, y, 'bat');
+      this.w = 10;
+      this.h = 8;
+      this.hp = 10;
+      this.speed = 0.9 + Math.random() * 0.3;
+      this.theta = Math.random() * Math.PI * 2;
+      this.omega = (Math.random() < 0.5 ? -1 : 1) * (0.02 + rng(0, 0.02));
+      this.vx = 0;
+      this.vy = 0;
+    }
+
+    update(dt) {
+      super.update(dt);
+      if (!this.alive || this.frozen > 0) return;
+
+      // Spiral/circular drift
+      this.theta += this.omega;
+      this.vx = Math.cos(this.theta) * this.speed;
+      this.vy = Math.sin(this.theta) * this.speed;
+      
+      // Test new position before moving
+      const newX = this.x + this.vx;
+      const newY = this.y + this.vy;
+      
+      // Check walls and bounce
+      let bounced = false;
+      if (newX < 8 || newX + this.w > LOG_W - 8) {
+        this.theta = Math.PI - this.theta;
+        this.omega *= -1;
+        bounced = true;
+      }
+      if (newY < 16 || newY + this.h > LOG_H - 8) {
+        this.theta = -this.theta;
+        this.omega *= -1;
+        bounced = true;
+      }
+      
+      // If bounced, recalculate velocity
+      if (bounced) {
+        this.vx = Math.cos(this.theta) * this.speed;
+        this.vy = Math.sin(this.theta) * this.speed;
+      }
+      
+      // Apply movement with clamping as safety
+      this.x = clamp(this.x + this.vx, 8, LOG_W - 8 - this.w);
+      this.y = clamp(this.y + this.vy, 16, LOG_H - 8 - this.h);
+    }
+
+    draw(ctx) {
+      if (!this.alive) return;
+      ctx.fillStyle = (this.flash > 0 && Math.floor(this.flash/2) % 2 === 0) ? '#fff' : colors.bat;
+      ctx.fillRect(this.x, this.y, this.w, this.h);
+      if (this.flash <= 0) {
+        ctx.fillStyle = '#000';
+        ctx.fillRect(this.x + 2, this.y + 2, 2, 2);
+      }
+    }
+  }
+
+  class Centipede extends Enemy {
+    constructor() {
+      const w = 10, h = 10;
+      super(LOG_W/2 - w/2, 40, 'centi');
+      this.w = w;
+      this.h = h;
+      this.segs = 4;
+      this.baseSpeed = 1.8;
+      this.speed = this.baseSpeed;
+      this.spacing = 8;
+      this.dir = 'right';
+      this.dist = 0;
+      this.must = Math.min(LOG_W, LOG_H) / 5;
+      this.head = {x: this.x, y: this.y, w: this.w, h: this.h};
+      this.path = [];
+      this.bodies = new Array(this.segs - 1).fill(0).map(_ => ({x: this.head.x, y: this.head.y, w: this.w, h: this.h}));
+      this.hp = this.segs; // HP based on segments
+    }
+
+    update(dt) {
+      super.update(dt);
+      if (!this.alive || this.frozen > 0) return;
+
+      const head = this.head;
+      const sp = this.speed;
+      const prev = {x: head.x, y: head.y};
+      
+      // Move head
+      if (this.dir === 'right') head.x += sp;
+      else if (this.dir === 'left') head.x -= sp;
+      else if (this.dir === 'up') head.y -= sp;
+      else head.y += sp;
+      
+      this.dist += sp;
+      
+      // Wall check
+      let hitWall = false;
+      if (head.x < 8) { head.x = 8; hitWall = true; }
+      if (head.x + head.w > LOG_W - 8) { head.x = LOG_W - 8 - head.w; hitWall = true; }
+      if (head.y < 16) { head.y = 16; hitWall = true; }
+      if (head.y + head.h > LOG_H - 8) { head.y = LOG_H - 8 - head.h; hitWall = true; }
+
+      // Push to path
+      this.path.push({x: prev.x, y: prev.y});
+      if (this.path.length > 800) this.path.shift();
+
+      // Change direction if needed
+      if (hitWall || this.dist >= this.must) {
+        this.dir = this.chooseNewDirection();
+        this.dist = 0;
+      }
+
+      // Update body segments
+      this.updateBodySegments();
+      
+      // Update main position for collision detection
+      this.x = head.x;
+      this.y = head.y;
+    }
+
+    chooseNewDirection() {
+      const dx = player.x - this.head.x;
+      const dy = player.y - this.head.y;
+      
+      const options = ['straight', 'left', 'right'];
+      const candidates = options.map(turn => {
+        const newDir = this.tryTurn(this.dir, turn);
+        const test = {x: this.head.x, y: this.head.y, w: this.w, h: this.h};
+        
+        if (newDir === 'right') test.x += 8;
+        else if (newDir === 'left') test.x -= 8;
+        else if (newDir === 'up') test.y -= 8;
+        else test.y += 8;
+        
+        const valid = test.x >= 8 && test.x + test.w <= LOG_W - 8 && 
+                     test.y >= 16 && test.y + test.h <= LOG_H - 8;
+        
+        const distToPlayer = Math.abs(test.x - player.x) + Math.abs(test.y - player.y);
+        
+        return {turn, dir: newDir, valid, distToPlayer};
+      });
+      
+      candidates.sort((a, b) => a.distToPlayer - b.distToPlayer);
+      const validMoves = candidates.filter(c => c.valid);
+      
+      const picked = validMoves[0] || candidates.find(c => c.turn !== 'straight' && c.valid) || candidates[0];
+      return picked.dir;
+    }
+
+    tryTurn(dir, turn) {
+      if (turn === 'straight') return dir;
+      const dirs = ['up', 'right', 'down', 'left'];
+      let idx = dirs.indexOf(dir);
+      idx = (idx + (turn === 'right' ? 1 : 3)) % 4;
+      return dirs[idx];
+    }
+
+    updateBodySegments() {
+      const need = (this.segs - 1) * this.spacing;
+      while (this.path.length < need) {
+        this.path.unshift({x: this.head.x, y: this.head.y});
+      }
+      for (let i = 0; i < this.bodies.length; i++) {
+        const idx = this.path.length - 1 - (i + 1) * this.spacing;
+        const p = this.path[Math.max(0, idx)];
+        this.bodies[i].x = p.x;
+        this.bodies[i].y = p.y;
+      }
+    }
+
+    draw(ctx) {
+      if (!this.alive) return;
+      ctx.fillStyle = (this.flash > 0 && Math.floor(this.flash/2) % 2 === 0) ? '#fff' : colors.centi;
+      ctx.fillRect(this.head.x, this.head.y, this.w, this.h);
+      for (const s of this.bodies) {
+        ctx.fillRect(s.x, s.y, this.w, this.h);
+      }
+    }
+
+    checkCollision(box) {
+      if (AABB(box, this.head)) return true;
+      for (const s of this.bodies) {
+        if (AABB(box, s)) return true;
+      }
+      return false;
+    }
+
+    checkPointHit(x, y) {
+      const pt = {x: x - 1, y: y - 1, w: 2, h: 2};
+      return this.checkCollision(pt);
+    }
+
+    takeDamage(amount, source) {
+      if (!this.alive) return false;
+      
+      // For centipede, damage removes segments
+      if (this.bodies.length > 0) {
+        this.bodies.pop();
+        this.segs--;
+        // Speed up by 15% for each lost segment
+        this.speed = this.baseSpeed * (1 + 0.15 * (4 - this.segs));
+        this.flash = 10;
+        return false; // still alive
+      } else {
+        // Head dies
+        this.alive = false;
+        return true; // died
+      }
+    }
+
+    onDeath(room) {
+      super.onDeath(room);
+      
+      // Trigger victory effect in throne room
+      if (room.id === ROOM.THRONE) {
+        victoryLight = 1.0;
+        room.rain = false;
+        room.lightning = false;
+      }
+    }
+
+    getHitbox() {
+      // Return array of hitboxes for centipede
+      return [this.head, ...this.bodies];
+    }
+
+    getCenter() {
+      return {x: this.head.x + this.w/2, y: this.head.y + this.h/2};
+    }
+  }
+
+  // Enemy Factory
+  const EnemyFactory = {
+    createBat: (x, y) => new Bat(x, y),
+    createCentipede: () => new Centipede()
+  };
+
   // Room definitions
   function makeRoom(id){
     const base={id, enemies:[], pickups:[], rupees:[], rain:false, lightning:false, carpet:false, doors:[]};
@@ -99,19 +408,16 @@
       base.bg='stone'; base.rain=false; // explicitly off
       // boomerang pickup
       base.pickups.push({kind:'boom', x:128, y:96, w:10,h:10, taken:false});
-      // 3 bats
-      for(let i=0;i<3;i++) base.enemies.push(makeBat(60+ i*50, 50 + i*20));
-      // doors: left <-> START, up -> THRONE
+      // 3 bats using factory
+      for(let i=0;i<3;i++) base.enemies.push(EnemyFactory.createBat(60+ i*50, 50 + i*20));
       base.doors.push({dir:'left', to:ROOM.START, x:0, y:LOG_H/2-12, w:10, h:24});
       // Fixed: door properly in the wall at y:14 (wall is 14-18)
       base.doors.push({dir:'up', to:ROOM.THRONE, x:LOG_W/2-12, y:14, w:24, h:10});
     } else if(id===ROOM.THRONE){
       base.bg='stone'; base.carpet=true; base.rain=true; base.lightning=true;
-      // centipede boss
-      base.enemies.push(makeCentipede());
-      // small heart pickup (restore 10) somewhere
+      // centipede boss using factory
+      base.enemies.push(EnemyFactory.createCentipede());
       base.pickups.push({kind:'heart', x:LOG_W-32, y:LOG_H-28, w:10,h:10, taken:false});
-      // door back down to GREY - positioned at bottom wall edge
       base.doors.push({dir:'down', to:ROOM.GREY, x:LOG_W/2-12, y:LOG_H-10, w:24, h:10});
     }
     return base;
@@ -120,135 +426,6 @@
   let rooms={ [ROOM.START]: makeRoom(ROOM.START), [ROOM.GREY]: makeRoom(ROOM.GREY), [ROOM.THRONE]: makeRoom(ROOM.THRONE) };
 
   function resetRooms(){ rooms={ [ROOM.START]: makeRoom(ROOM.START), [ROOM.GREY]: makeRoom(ROOM.GREY), [ROOM.THRONE]: makeRoom(ROOM.THRONE) }; }
-
-  // ===== Enemies =====
-  function makeBat(x,y){
-    return {type:'bat', x, y, w:10, h:8, hp:10, alive:true, speed:0.9 + Math.random()*0.3, theta: Math.random()*Math.PI*2, omega: (Math.random()<.5?-1:1)*(0.02+rng(0,0.02)), vx:0, vy:0, frozen:0, flash:0};
-  }
-  function updateBat(b){
-    if(!b.alive) return;
-    // Handle freeze and flash countdown
-    if(b.frozen>0) { b.frozen--; return; }
-    if(b.flash>0) b.flash--;
-    // spiral/circular drift
-    b.theta += b.omega;
-    b.vx = Math.cos(b.theta)*b.speed;
-    b.vy = Math.sin(b.theta)*b.speed;
-    
-    // Test new position before moving
-    const newX = b.x + b.vx;
-    const newY = b.y + b.vy;
-    
-    // Check walls and bounce
-    let bounced = false;
-    if(newX < 8 || newX + b.w > LOG_W - 8) {
-      b.theta = Math.PI - b.theta; // Reverse horizontal direction
-      b.omega *= -1; // Reverse spin
-      bounced = true;
-    }
-    if(newY < 16 || newY + b.h > LOG_H - 8) {
-      b.theta = -b.theta; // Reverse vertical direction
-      b.omega *= -1; // Reverse spin
-      bounced = true;
-    }
-    
-    // If bounced, recalculate velocity
-    if(bounced) {
-      b.vx = Math.cos(b.theta) * b.speed;
-      b.vy = Math.sin(b.theta) * b.speed;
-    }
-    
-    // Apply movement with clamping as safety
-    b.x = clamp(b.x + b.vx, 8, LOG_W - 8 - b.w);
-    b.y = clamp(b.y + b.vy, 16, LOG_H - 8 - b.h);
-  }
-
-  function makeCentipede(){
-    const segs=4, speed=1.8; // faster than player
-    const w=10,h=10;
-    const head={x:LOG_W/2-w/2,y:40,w,h};
-    const path=[]; // recent head positions
-    const spacing=8; // px between segments along path
-    return {type:'centi', alive:true, segs, w,h, baseSpeed:speed, speed, spacing, dir:'right', dist:0, must: Math.min(LOG_W,LOG_H)/5, head, path, bodies: new Array(segs-1).fill(0).map(_=>({x:head.x,y:head.y,w,h})), frozen:0, flash:0 };
-  }
-  function tryTurn(dir, turn){ // turn: 'left'|'right'|'straight'
-    if(turn==='straight') return dir;
-    const dirs=['up','right','down','left'];
-    let idx=dirs.indexOf(dir);
-    idx = (idx + (turn==='right'?1:3))%4;
-    return dirs[idx];
-  }
-  function moveCenti(c){
-    if(!c.alive) return;
-    // Handle freeze and flash countdown
-    if(c.frozen>0) { c.frozen--; return; }
-    if(c.flash>0) c.flash--;
-    
-    const head=c.head;
-    const sp=c.speed;
-    const prev={x:head.x,y:head.y};
-    if(c.dir==='right') head.x+=sp; else if(c.dir==='left') head.x-=sp; else if(c.dir==='up') head.y-=sp; else head.y+=sp;
-    c.dist+=sp;
-    // wall check
-    let hitWall=false;
-    if(head.x<8){ head.x=8; hitWall=true; }
-    if(head.x+head.w>LOG_W-8){ head.x=LOG_W-8-head.w; hitWall=true; }
-    if(head.y<16){ head.y=16; hitWall=true; }
-    if(head.y+head.h>LOG_H-8){ head.y=LOG_H-8-head.h; hitWall=true; }
-
-    // push path
-    c.path.push({x:prev.x,y:prev.y}); if(c.path.length>800) c.path.shift();
-
-    if(hitWall || c.dist>=c.must){
-      // Chase player - calculate best direction
-      const dx = player.x - head.x;
-      const dy = player.y - head.y;
-      
-      // Determine which turn gets us closer to player
-      const options = ['straight', 'left', 'right'];
-      const candidates = options.map(turn => {
-        const newDir = tryTurn(c.dir, turn);
-        const test = {x:head.x, y:head.y, w:c.w, h:c.h};
-        
-        // Simulate move in this direction
-        if(newDir==='right') test.x+=8; 
-        else if(newDir==='left') test.x-=8; 
-        else if(newDir==='up') test.y-=8; 
-        else test.y+=8;
-        
-        // Check if valid (not hitting wall)
-        const valid = test.x>=8 && test.x+test.w<=LOG_W-8 && test.y>=16 && test.y+test.h<=LOG_H-8;
-        
-        // Calculate distance to player after this move
-        const distToPlayer = Math.abs(test.x - player.x) + Math.abs(test.y - player.y);
-        
-        return {turn, dir: newDir, valid, distToPlayer};
-      });
-      
-      // Sort by distance to player (closer is better), filter valid moves
-      candidates.sort((a,b) => a.distToPlayer - b.distToPlayer);
-      const validMoves = candidates.filter(c => c.valid);
-      
-      // Pick best valid move, or forced turn if hit wall
-      let picked = validMoves[0];
-      if(!picked) {
-        // No valid moves, try any turn
-        picked = candidates.find(c => c.turn!=='straight' && c.valid) || candidates[0];
-      }
-      
-      c.dir = picked.dir;
-      c.dist = 0;
-    }
-
-    // follow path for body segs - fixed: use c.spacing instead of undefined spacing
-    const need=(c.segs-1)*c.spacing;
-    while(c.path.length<need) c.path.unshift({x:head.x,y:head.y});
-    for(let i=0;i<c.bodies.length;i++){
-      const idx=c.path.length-1 - (i+1)*c.spacing;
-      const p=c.path[Math.max(0, idx)];
-      c.bodies[i].x=p.x; c.bodies[i].y=p.y;
-    }
-  }
 
   // ===== Projectiles & attacks =====
   const melee={active:false, t:0, dur:8, box:{x:0,y:0,w:12,h:12}};
@@ -332,18 +509,8 @@
   }
 
   function drawEnemies(r){
-    for(const e of r.enemies){ if(!e.alive) continue; 
-      if(e.type==='bat'){
-        // Flash white if hit
-        ctx.fillStyle=(e.flash>0 && Math.floor(e.flash/2)%2===0) ? '#fff' : colors.bat; 
-        ctx.fillRect(e.x,e.y,e.w,e.h);
-        if(e.flash<=0) { ctx.fillStyle='#000'; ctx.fillRect(e.x+2,e.y+2,2,2); }
-      } else if(e.type==='centi'){
-        // draw head + body segs as blocks with flash effect
-        ctx.fillStyle=(e.flash>0 && Math.floor(e.flash/2)%2===0) ? '#fff' : colors.centi;
-        ctx.fillRect(e.head.x,e.head.y,e.w,e.h);
-        for(const s of e.bodies) ctx.fillRect(s.x,s.y,e.w,e.h);
-      } 
+    for(const e of r.enemies){
+      e.dispatch('draw', {ctx});
     }
   }
 
@@ -429,60 +596,61 @@
         if(boomer.returning){ const to={x:player.x+player.w/2, y:player.y+player.h/2}; const dx=to.x-boomer.x, dy=to.y-boomer.y; const d=Math.hypot(dx,dy)||1; boomer.vx=dx/d*2.4; boomer.vy=dy/d*2.4; boomer.x+=boomer.vx; boomer.y+=boomer.vy; if(Math.hypot(to.x-boomer.x,to.y-boomer.y)<4){ boomer=null; } }
       }
 
-      // Enemy updates & collisions
+      // Enemy updates
       const r=rooms[room];
-      for(const e of r.enemies){ if(!e.alive) continue; if(e.type==='bat'){ updateBat(e); }
-        else if(e.type==='centi'){ moveCenti(e); }
+      for(const e of r.enemies){
+        e.dispatch('update', {dt});
       }
 
       // Combat resolution
       // Melee hits
-      if(melee.active){ for(const e of r.enemies){ if(!e.alive) continue; if(e.type==='bat'){ if(AABB(melee.box,e)){ e.hp-=10; if(e.hp<=0){ e.alive=false; dropRupee(r, e.x+e.w/2, e.y+e.h/2); } } }
-        else if(e.type==='centi'){
-          // any segment hit destroys one segment immediately
-          if(rectHitCenti(melee.box,e)) destroyCentiSeg(e);
+      if(melee.active){
+        for(const e of r.enemies){
+          if(!e.alive) continue;
+          if(e.dispatch('collide', {box: melee.box})){
+            const died = e.dispatch('damage', {amount: 10, source: 'melee'});
+            if(died) e.dispatch('death', {room: r});
+          }
         }
-      } }
+      }
 
       // Boomerang damage (pierces, can hit twice - once each way)
-      if(boomer){ 
-        for(const e of r.enemies){ 
-          if(!e.alive) continue; 
-          if(e.type==='bat'){ 
-            // Track hits per direction (0=outgoing, 1=returning)
+      if(boomer){
+        for(const e of r.enemies){
+          if(!e.alive) continue;
+          
+          if(e.type === 'bat'){
             const hitKey = boomer.returning ? 1 : 0;
             const wasHit = boomer.hitIds.get(e);
             const alreadyHitThisWay = wasHit && wasHit[hitKey];
             
-            if(pointInRect(boomer.x,boomer.y,e) && !alreadyHitThisWay) { 
-              // Mark this hit
+            if(e.dispatch('pointHit', {x: boomer.x, y: boomer.y}) && !alreadyHitThisWay){
               if(!wasHit) boomer.hitIds.set(e, {0:false, 1:false});
               boomer.hitIds.get(e)[hitKey] = true;
               
-              // Apply damage and effects
-              e.hp-=5; 
-              e.frozen=18; // 0.3 seconds at 60fps
-              e.flash=10;
-              if(e.hp<=0){ e.alive=false; dropRupee(r, e.x+e.w/2, e.y+e.h/2); } 
-            } 
-          }
-          else if(e.type==='centi'){ 
-            // For centipede, simpler approach - can hit once per throw
-            if(pointHitCenti(boomer.x,boomer.y,e) && !boomer.hitIds.has(e)) { 
+              e.dispatch('freeze', {duration: 18});
+              const died = e.dispatch('damage', {amount: 5, source: 'boomerang'});
+              if(died) e.dispatch('death', {room: r});
+            }
+          } else if(e.type === 'centi'){
+            if(e.dispatch('pointHit', {x: boomer.x, y: boomer.y}) && !boomer.hitIds.has(e)){
               boomer.hitIds.set(e, true);
-              e.frozen=18; // 0.3 seconds freeze
-              e.flash=10;
-              destroyCentiSeg(e); 
-            } 
+              e.dispatch('freeze', {duration: 18});
+              const died = e.dispatch('damage', {amount: 1, source: 'boomerang'});
+              if(died) e.dispatch('death', {room: r});
+            }
           }
-        } 
+        }
       }
 
       // Player vs enemy touch damage with knockback
       if(player.inv>0) player.inv--; else {
-        for(const e of r.enemies){ if(!e.alive) continue; if(e.type==='bat'){ if(AABB(player,e)){ damagePlayerFrom(e.x+e.w/2, e.y+e.h/2); break; } }
-          else if(e.type==='centi'){
-            if(AABB(player,e.head) || e.bodies.some(s=>AABB(player,s))){ damagePlayerFrom(e.head.x+e.w/2, e.head.y+e.h/2); break; }
+        for(const e of r.enemies){
+          if(!e.alive) continue;
+          if(e.dispatch('collide', {box: player})){
+            const center = e.getCenter();
+            damagePlayerFrom(center.x, center.y);
+            break;
           }
         }
       }
