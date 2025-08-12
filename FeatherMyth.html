@@ -1,0 +1,591 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>FeatherMyth — Hyrule‑ish (3 rooms)</title>
+<style>
+  :root{
+    --bg:#0e0e10; --hud:#e5e5e5; --accent:#7cf; --accent2:#f7a; --shadow: rgba(0,0,0,.6);
+    --grass:#1e5d39; --grass2:#2c7d4f; --stone:#3b3f4b; --stone2:#53586a; --carpet:#6e0a16; --carpet2:#8f0f1e;
+    --door:#000; --player:#ffefc2; --sword:#f7e39f; --boomer:#bde3ff; --rupee:#7fffd4;
+    --bat:#9b59b6; --centi:#f4d35e;
+  }
+  html,body{height:100%;margin:0;background:#0a0b12;color:var(--hud);font-family: ui-monospace, Menlo, Consolas, monospace}
+  .wrap{height:100%;display:grid;place-items:center;padding:1rem}
+  .frame{position:relative;width:min(96vw, 1120px);aspect-ratio:4/3;border-radius:18px;overflow:hidden;background:#06070b;box-shadow:0 24px 64px rgba(0,0,0,.7), inset 0 0 0 2px rgba(255,255,255,.06)}
+  canvas{position:absolute;inset:0;width:100%;height:100%;image-rendering: pixelated;display:block}
+  .hud{position:absolute;inset:auto 12px 10px 12px;display:flex;justify-content:space-between;pointer-events:none;font-size:clamp(12px,1.5vw,15px);text-shadow:0 2px 0 #000,0 0 6px var(--shadow)}
+  .legend{position:absolute;left:12px;top:10px;font-size:clamp(11px,1.4vw,14px);color:#cfe1ff;opacity:.9;text-shadow:0 2px 0 #000,0 0 6px var(--shadow);user-select:none}
+  .badge{display:inline-block;padding:.08rem .4rem;border-radius:6px;background:rgba(255,255,255,.08);box-shadow: inset 0 0 0 1px rgba(255,255,255,.15);margin-left:.35rem}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="frame" id="frame">
+    <canvas id="game"></canvas>
+    <canvas id="fx"></canvas>
+    <div class="legend">
+      <strong>FeatherMyth</strong> <span class="badge">3 rooms (Start → Right → Up)</span><br>
+      Move: <b>WASD / Arrows</b> · Sword: <b>Z</b> · Boomerang: <b>X</b>
+    </div>
+    <div class="hud"><div id="hearts"></div><div id="stats"></div></div>
+  </div>
+</div>
+<script>
+(()=>{
+  // ===== Resolution & canvas =====
+  const LOG_W = 256, LOG_H = 192; // compact 4:3-ish NES vibe
+  const frame = document.getElementById('frame');
+  const game = document.getElementById('game');
+  const fx = document.getElementById('fx');
+  const heartsEl = document.getElementById('hearts');
+  const statsEl = document.getElementById('stats');
+  function resize(){ game.width=LOG_W; game.height=LOG_H; fx.width=LOG_W; fx.height=LOG_H; }
+  window.addEventListener('resize', resize); resize();
+  const ctx = game.getContext('2d');
+  const ftx = fx.getContext('2d');
+
+  // ===== Color palette (stored as constants instead of CSS vars) =====
+  const colors = {
+    grass: '#1e5d39', grass2: '#2c7d4f', 
+    stone: '#3b3f4b', stone2: '#53586a', 
+    carpet: '#6e0a16', carpet2: '#8f0f1e',
+    door: '#000', player: '#ffefc2', 
+    sword: '#f7e39f', boomer: '#bde3ff', 
+    rupee: '#7fffd4', bat: '#9b59b6', 
+    centi: '#f4d35e', accent: '#7cf'
+  };
+
+  // ===== Utilities =====
+  const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
+  const rng=(a,b)=>a+Math.random()*(b-a);
+  const AABB=(a,b)=>a.x<b.x+b.w&&a.x+a.w>b.x&&a.y<b.y+b.h&&a.y+a.h>b.y;
+
+  // ===== Input =====
+  const keys=new Map(), once=new Map();
+  const mapKey = (c) => (
+    (c==='ArrowUp'||c==='KeyW') ? 'up' :
+    (c==='ArrowDown'||c==='KeyS') ? 'down' :
+    (c==='ArrowLeft'||c==='KeyA') ? 'left' :
+    (c==='ArrowRight'||c==='KeyD') ? 'right' :
+    (c==='KeyZ') ? 'sword' :
+    (c==='KeyX') ? 'boom' :
+    null
+  );
+  addEventListener('keydown',e=>{const k=mapKey(e.code); if(!k) return; if(!keys.get(k)) once.set(k,true); keys.set(k,true); e.preventDefault();});
+  addEventListener('keyup',e=>{const k=mapKey(e.code); if(!k) return; keys.set(k,false); e.preventDefault();});
+
+  // ===== Game state =====
+  const player={x:112,y:120,w:10,h:12,vx:0,vy:0,spd:1.4,face:'down',hp:30,inv:0,hasSword:false,hasBoom:false,alive:true};
+  const inventory={rupees:0};
+  let victoryLight = 0; // For throne room victory effect
+
+  // Rooms graph: 1 (start, rain) -> right -> 2 (grey, no rain) -> up -> 3 (throne, rain + lightning)
+  const ROOM={ START:1, GREY:2, THRONE:3 };
+  let room = ROOM.START;
+
+  // Room definitions
+  function makeRoom(id){
+    const base={id, enemies:[], pickups:[], rupees:[], rain:false, lightning:false, carpet:false, doors:[]};
+    if(id===ROOM.START){
+      base.rain=true;
+      base.bg='grass';
+      // sword pickup
+      base.pickups.push({kind:'sword', x:120, y:136, w:10, h:10, taken:false});
+      // doors: right -> GREY
+      base.doors.push({dir:'right', to:ROOM.GREY, x:LOG_W-10, y:LOG_H/2-12, w:10, h:24});
+    } else if(id===ROOM.GREY){
+      base.bg='stone'; base.rain=false; // explicitly off
+      // boomerang pickup
+      base.pickups.push({kind:'boom', x:128, y:96, w:10,h:10, taken:false});
+      // 3 bats
+      for(let i=0;i<3;i++) base.enemies.push(makeBat(60+ i*50, 50 + i*20));
+      // doors: left <-> START, up -> THRONE
+      base.doors.push({dir:'left', to:ROOM.START, x:0, y:LOG_H/2-12, w:10, h:24});
+      // Fixed: door properly in the wall at y:14 (wall is 14-18)
+      base.doors.push({dir:'up', to:ROOM.THRONE, x:LOG_W/2-12, y:14, w:24, h:10});
+    } else if(id===ROOM.THRONE){
+      base.bg='stone'; base.carpet=true; base.rain=true; base.lightning=true;
+      // centipede boss
+      base.enemies.push(makeCentipede());
+      // small heart pickup (restore 10) somewhere
+      base.pickups.push({kind:'heart', x:LOG_W-32, y:LOG_H-28, w:10,h:10, taken:false});
+      // door back down to GREY - positioned at bottom wall edge
+      base.doors.push({dir:'down', to:ROOM.GREY, x:LOG_W/2-12, y:LOG_H-10, w:24, h:10});
+    }
+    return base;
+  }
+
+  let rooms={ [ROOM.START]: makeRoom(ROOM.START), [ROOM.GREY]: makeRoom(ROOM.GREY), [ROOM.THRONE]: makeRoom(ROOM.THRONE) };
+
+  function resetRooms(){ rooms={ [ROOM.START]: makeRoom(ROOM.START), [ROOM.GREY]: makeRoom(ROOM.GREY), [ROOM.THRONE]: makeRoom(ROOM.THRONE) }; }
+
+  // ===== Enemies =====
+  function makeBat(x,y){
+    return {type:'bat', x, y, w:10, h:8, hp:10, alive:true, speed:0.9 + Math.random()*0.3, theta: Math.random()*Math.PI*2, omega: (Math.random()<.5?-1:1)*(0.02+rng(0,0.02)), vx:0, vy:0, frozen:0, flash:0};
+  }
+  function updateBat(b){
+    if(!b.alive) return;
+    // Handle freeze and flash countdown
+    if(b.frozen>0) { b.frozen--; return; }
+    if(b.flash>0) b.flash--;
+    // spiral/circular drift
+    b.theta += b.omega;
+    b.vx = Math.cos(b.theta)*b.speed;
+    b.vy = Math.sin(b.theta)*b.speed;
+    
+    // Test new position before moving
+    const newX = b.x + b.vx;
+    const newY = b.y + b.vy;
+    
+    // Check walls and bounce
+    let bounced = false;
+    if(newX < 8 || newX + b.w > LOG_W - 8) {
+      b.theta = Math.PI - b.theta; // Reverse horizontal direction
+      b.omega *= -1; // Reverse spin
+      bounced = true;
+    }
+    if(newY < 16 || newY + b.h > LOG_H - 8) {
+      b.theta = -b.theta; // Reverse vertical direction
+      b.omega *= -1; // Reverse spin
+      bounced = true;
+    }
+    
+    // If bounced, recalculate velocity
+    if(bounced) {
+      b.vx = Math.cos(b.theta) * b.speed;
+      b.vy = Math.sin(b.theta) * b.speed;
+    }
+    
+    // Apply movement with clamping as safety
+    b.x = clamp(b.x + b.vx, 8, LOG_W - 8 - b.w);
+    b.y = clamp(b.y + b.vy, 16, LOG_H - 8 - b.h);
+  }
+
+  function makeCentipede(){
+    const segs=4, speed=1.8; // faster than player
+    const w=10,h=10;
+    const head={x:LOG_W/2-w/2,y:40,w,h};
+    const path=[]; // recent head positions
+    const spacing=8; // px between segments along path
+    return {type:'centi', alive:true, segs, w,h, baseSpeed:speed, speed, spacing, dir:'right', dist:0, must: Math.min(LOG_W,LOG_H)/5, head, path, bodies: new Array(segs-1).fill(0).map(_=>({x:head.x,y:head.y,w,h})), frozen:0, flash:0 };
+  }
+  function tryTurn(dir, turn){ // turn: 'left'|'right'|'straight'
+    if(turn==='straight') return dir;
+    const dirs=['up','right','down','left'];
+    let idx=dirs.indexOf(dir);
+    idx = (idx + (turn==='right'?1:3))%4;
+    return dirs[idx];
+  }
+  function moveCenti(c){
+    if(!c.alive) return;
+    // Handle freeze and flash countdown
+    if(c.frozen>0) { c.frozen--; return; }
+    if(c.flash>0) c.flash--;
+    
+    const head=c.head;
+    const sp=c.speed;
+    const prev={x:head.x,y:head.y};
+    if(c.dir==='right') head.x+=sp; else if(c.dir==='left') head.x-=sp; else if(c.dir==='up') head.y-=sp; else head.y+=sp;
+    c.dist+=sp;
+    // wall check
+    let hitWall=false;
+    if(head.x<8){ head.x=8; hitWall=true; }
+    if(head.x+head.w>LOG_W-8){ head.x=LOG_W-8-head.w; hitWall=true; }
+    if(head.y<16){ head.y=16; hitWall=true; }
+    if(head.y+head.h>LOG_H-8){ head.y=LOG_H-8-head.h; hitWall=true; }
+
+    // push path
+    c.path.push({x:prev.x,y:prev.y}); if(c.path.length>800) c.path.shift();
+
+    if(hitWall || c.dist>=c.must){
+      // Chase player - calculate best direction
+      const dx = player.x - head.x;
+      const dy = player.y - head.y;
+      
+      // Determine which turn gets us closer to player
+      const options = ['straight', 'left', 'right'];
+      const candidates = options.map(turn => {
+        const newDir = tryTurn(c.dir, turn);
+        const test = {x:head.x, y:head.y, w:c.w, h:c.h};
+        
+        // Simulate move in this direction
+        if(newDir==='right') test.x+=8; 
+        else if(newDir==='left') test.x-=8; 
+        else if(newDir==='up') test.y-=8; 
+        else test.y+=8;
+        
+        // Check if valid (not hitting wall)
+        const valid = test.x>=8 && test.x+test.w<=LOG_W-8 && test.y>=16 && test.y+test.h<=LOG_H-8;
+        
+        // Calculate distance to player after this move
+        const distToPlayer = Math.abs(test.x - player.x) + Math.abs(test.y - player.y);
+        
+        return {turn, dir: newDir, valid, distToPlayer};
+      });
+      
+      // Sort by distance to player (closer is better), filter valid moves
+      candidates.sort((a,b) => a.distToPlayer - b.distToPlayer);
+      const validMoves = candidates.filter(c => c.valid);
+      
+      // Pick best valid move, or forced turn if hit wall
+      let picked = validMoves[0];
+      if(!picked) {
+        // No valid moves, try any turn
+        picked = candidates.find(c => c.turn!=='straight' && c.valid) || candidates[0];
+      }
+      
+      c.dir = picked.dir;
+      c.dist = 0;
+    }
+
+    // follow path for body segs - fixed: use c.spacing instead of undefined spacing
+    const need=(c.segs-1)*c.spacing;
+    while(c.path.length<need) c.path.unshift({x:head.x,y:head.y});
+    for(let i=0;i<c.bodies.length;i++){
+      const idx=c.path.length-1 - (i+1)*c.spacing;
+      const p=c.path[Math.max(0, idx)];
+      c.bodies[i].x=p.x; c.bodies[i].y=p.y;
+    }
+  }
+
+  // ===== Projectiles & attacks =====
+  const melee={active:false, t:0, dur:8, box:{x:0,y:0,w:12,h:12}};
+  let boomer=null; // returning projectile
+
+  function startSlash(){ if(!player.hasSword||melee.active) return; melee.active=true; melee.t=melee.dur; }
+  function throwBoom(){ if(!player.hasBoom||boomer) return; const d=dirVec(player.face); boomer={x:player.x+player.w/2, y:player.y+player.h/2, vx:d.x*2.2, vy:d.y*2.2, max:64, dist:0, returning:false, hitIds:new Map()}; }
+  function dirVec(face){ return face==='up'?{x:0,y:-1}: face==='down'?{x:0,y:1}: face==='left'?{x:-1,y:0}:{x:1,y:0}; }
+
+  // ===== Rain & lightning =====
+  const drops=[]; function initRain(){ drops.length=0; for(let i=0;i<100;i++) drops.push({x:Math.random()*LOG_W,y:Math.random()*LOG_H,len:6+Math.random()*8,spd:1.8+Math.random()*1.5}); }
+  initRain();
+  function drawRain(){
+    ftx.clearRect(0,0,LOG_W,LOG_H);
+    
+    // Victory light effect (golden halo)
+    if (victoryLight > 0) {
+      const gradient = ftx.createRadialGradient(LOG_W/2, LOG_H/2, 0, LOG_W/2, LOG_H/2, Math.max(LOG_W, LOG_H)/2);
+      gradient.addColorStop(0, `rgba(255, 230, 100, ${victoryLight * 0.5})`);
+      gradient.addColorStop(0.5, `rgba(255, 210, 50, ${victoryLight * 0.3})`);
+      gradient.addColorStop(1, `rgba(255, 200, 0, 0)`);
+      ftx.fillStyle = gradient;
+      ftx.fillRect(0, 0, LOG_W, LOG_H);
+      
+      // Slowly fade out
+      //victoryLight = Math.max(0, victoryLight - 0.002);
+    }
+    
+    if(!rooms[room].rain){ return; }
+    ftx.globalAlpha=.65; ftx.strokeStyle='rgba(160,200,255,0.8)'; ftx.lineWidth=1; ftx.beginPath();
+    for(const d of drops){
+      ftx.moveTo(d.x,d.y); ftx.lineTo(d.x-2,d.y+d.len);
+      d.x-=0.6*d.spd; d.y+=d.spd;
+      if(d.y>LOG_H+8){ d.y=-8; d.x=Math.random()*LOG_W;}
+      if(d.x<-8){ d.x=LOG_W+8; }
+    }
+    ftx.stroke(); ftx.globalAlpha=1;
+    if(lightFlash>0){ ftx.fillStyle=`rgba(255,255,255,${lightFlash})`; ftx.fillRect(0,0,LOG_W,LOG_H); }
+  }
+  let lightTimer= rng(90,200), lightFlash=0;
+
+  // ===== Drawing helpers =====
+  function drawRoomBG(r){
+    if(r.bg==='grass'){
+      // dithered grass
+      ctx.fillStyle=colors.grass; ctx.fillRect(0,0,LOG_W,LOG_H);
+      ctx.fillStyle=colors.grass2; for(let y=16; y<LOG_H; y+=8){ for(let x=(y%16?4:0); x<LOG_W; x+=8){ ctx.fillRect(x,y,4,4); } }
+    } else { // stone
+      ctx.fillStyle=colors.stone; ctx.fillRect(0,0,LOG_W,LOG_H);
+      ctx.fillStyle=colors.stone2; for(let y=16; y<LOG_H; y+=12){ for(let x=(y%24?6:0); x<LOG_W; x+=12){ ctx.fillRect(x,y,6,6); } }
+    }
+    // top HUD gutter line
+    ctx.fillStyle='rgba(0,0,0,.4)'; ctx.fillRect(0,0,LOG_W,14);
+    // carpet in throne
+    if(r.carpet){
+      const w=LOG_W-40, h=LOG_H-70, x=(LOG_W-w)/2, y=24;
+      ctx.fillStyle=colors.carpet; ctx.fillRect(x,y,w,h);
+      ctx.fillStyle=colors.carpet2; for(let i=0;i<4;i++) ctx.fillRect(x+4+i*3, y+4+i*3, w-8-i*6, 2);
+      // throne
+      ctx.fillStyle='#1d0e0e'; ctx.fillRect(LOG_W/2-10, y+8, 20, 14);
+      ctx.fillStyle='#3b1b1b'; ctx.fillRect(LOG_W/2-8, y+10, 16, 10);
+    }
+    // walls - draw before doors so doors overlay properly
+    ctx.fillStyle='#0b0c11'; 
+    ctx.fillRect(0,14,LOG_W,4); // top wall
+    ctx.fillRect(0,14,4,LOG_H-14); // left wall
+    ctx.fillRect(LOG_W-4,14,4,LOG_H-14); // right wall
+    ctx.fillRect(0,LOG_H-4,LOG_W,4); // bottom wall
+    // doors (black rectangles) - draw after walls so they overlay
+    for(const d of r.doors){ ctx.fillStyle=colors.door; ctx.fillRect(d.x,d.y,d.w,d.h); }
+  }
+
+  function drawPlayer(){
+    const p=player; // body
+    // flicker while invincible
+    if(p.inv>0 && (Math.floor(perf/60)%2===0)) return;
+    ctx.fillStyle='#2b2b2b'; ctx.fillRect(p.x-1,p.y-1,p.w+2,p.h+2);
+    ctx.fillStyle=colors.player; ctx.fillRect(p.x,p.y,p.w,p.h);
+    // face stripe
+    ctx.fillStyle=colors.accent; ctx.fillRect(p.x+2,p.y+2,p.w-4,2);
+  }
+
+  function drawEnemies(r){
+    for(const e of r.enemies){ if(!e.alive) continue; 
+      if(e.type==='bat'){
+        // Flash white if hit
+        ctx.fillStyle=(e.flash>0 && Math.floor(e.flash/2)%2===0) ? '#fff' : colors.bat; 
+        ctx.fillRect(e.x,e.y,e.w,e.h);
+        if(e.flash<=0) { ctx.fillStyle='#000'; ctx.fillRect(e.x+2,e.y+2,2,2); }
+      } else if(e.type==='centi'){
+        // draw head + body segs as blocks with flash effect
+        ctx.fillStyle=(e.flash>0 && Math.floor(e.flash/2)%2===0) ? '#fff' : colors.centi;
+        ctx.fillRect(e.head.x,e.head.y,e.w,e.h);
+        for(const s of e.bodies) ctx.fillRect(s.x,s.y,e.w,e.h);
+      } 
+    }
+  }
+
+  function drawPickups(r){
+    for(const it of r.pickups){ if(it.taken) continue; if(it.kind==='sword'){ ctx.fillStyle=colors.sword; ctx.fillRect(it.x,it.y,it.w,it.h); ctx.fillStyle='#6b5b2a'; ctx.fillRect(it.x+3,it.y+2,4,2); }
+      else if(it.kind==='boom'){ ctx.fillStyle=colors.boomer; ctx.fillRect(it.x,it.y,it.w,it.h); ctx.fillStyle='#6aa2d8'; ctx.fillRect(it.x+1,it.y+4,it.w-2,2); }
+      else if(it.kind==='heart'){ ctx.fillStyle='#ff4d4d'; ctx.fillRect(it.x,it.y,it.w,it.h); }
+    }
+  }
+
+  function drawRupees(r){ ctx.fillStyle=colors.rupee; for(const g of r.rupees){ ctx.fillRect(g.x,g.y,g.w,g.h); ctx.fillStyle='#b7ffe6'; ctx.fillRect(g.x+2,g.y+2, g.w-4, g.h-4); ctx.fillStyle=colors.rupee; } }
+
+  function drawMelee(){ if(!melee.active) return; const b=melee.box; ctx.fillStyle='rgba(255,240,160,.85)'; ctx.fillRect(b.x,b.y,b.w,b.h); }
+  function drawBoom(){ if(!boomer) return; ctx.fillStyle=colors.boomer; ctx.fillRect(boomer.x-3, boomer.y-3, 6, 6); }
+
+  function drawHUD(){
+    // hearts (3 boxes)
+    const hp=player.hp; const full=hp>=30?3:hp>=20?2:hp>=10?1:0; // boxes not partial per spec
+    let html=''; for(let i=0;i<3;i++){ const on=i<full; html+=`<span style="display:inline-block;width:18px;height:12px;border:1px solid #000;background:${on?'#ff5252':'#111'};box-shadow: inset 0 0 0 1px rgba(255,255,255,.2);margin-right:6px"></span>`; }
+    heartsEl.innerHTML=html;
+    const hasS=player.hasSword?'Yes':'—', hasB=player.hasBoom?'Yes':'—';
+    statsEl.innerHTML=`Rupees: <b>${inventory.rupees}</b> · Sword: <b>${hasS}</b> · Boomerang: <b>${hasB}</b>`;
+  }
+
+  // ===== Room transitions (scroll) =====
+  // Player disappears during scroll; new room slides in; player reappears at the matching entrance
+  let transState=null; // {from,to,dir,prog}
+  function beginTransition(to, dir){ if(transState) return; transState={from:room,to,dir,prog:0}; }
+  function renderTransition(dt){ if(!transState) return false; const sp=0.08; transState.prog+=sp*dt; const p=Math.min(1,transState.prog);
+    const from=rooms[transState.from], to=rooms[transState.to];
+    const dx = transState.dir==='right' ? -p*LOG_W : transState.dir==='left' ? p*LOG_W : 0;
+    const dy = transState.dir==='up' ? p*LOG_H : transState.dir==='down' ? -p*LOG_H : 0;
+    ctx.save(); ctx.translate(dx,dy); drawRoomBG(from); drawPickups(from); drawEnemies(from); drawRupees(from); ctx.restore();
+    const tx = transState.dir==='right' ? LOG_W+dx : transState.dir==='left' ? -LOG_W+dx : 0;
+    const ty = transState.dir==='up' ? -LOG_H+dy : transState.dir==='down' ? LOG_H+dy : 0;
+    ctx.save(); ctx.translate(tx,ty); drawRoomBG(to); drawPickups(to); drawEnemies(to); drawRupees(to); ctx.restore();
+    if(p>=1){ room=transState.to; finalizeSpawn(opposite(transState.dir)); transState=null; }
+    return true;
+  }
+  function opposite(dir){ return dir==='left'?'right':dir==='right'?'left':dir==='up'?'down':'up'; }
+  function finalizeSpawn(dir){
+    // Fixed: spawn from the opposite entrance direction
+    // When entering from left, player came from right, so spawn on left side
+    if(dir==='left'){ player.x=20; player.y=LOG_H/2-6; player.face='right'; }
+    if(dir==='right'){ player.x=LOG_W-30; player.y=LOG_H/2-6; player.face='left'; }
+    if(dir==='down'){ player.x=LOG_W/2-6; player.y=LOG_H-30; player.face='up'; }
+    if(dir==='up'){ player.x=LOG_W/2-6; player.y=32; player.face='down'; }
+  }
+
+  // ===== Game loop =====
+  let perf=performance.now();
+  function loop(now){
+    const dt=clamp((now-perf)/(1000/60),0.5,2.0); perf=now;
+    // Lightning scheduling
+    if(rooms[room].lightning){ lightTimer--; if(lightTimer<=0){ lightFlash=0.85; lightTimer=rng(120,260);} if(lightFlash>0) lightFlash=Math.max(0, lightFlash-0.08*dt); } else { lightFlash=0; lightTimer=rng(90,200); }
+
+    // Input & movement (disabled during transition)
+    if(!transState){
+      const up=!!keys.get('up'), dn=!!keys.get('down'), lf=!!keys.get('left'), rt=!!keys.get('right');
+      player.vx = (rt?player.spd:0) + (lf?-player.spd:0);
+      player.vy = (dn?player.spd:0) + (up?-player.spd:0);
+      if(Math.abs(player.vx)+Math.abs(player.vy)>0){ if(rt) player.face='right'; else if(lf) player.face='left'; else if(up) player.face='up'; else if(dn) player.face='down'; }
+      player.x = clamp(player.x + player.vx, 8, LOG_W-8-player.w);
+      player.y = clamp(player.y + player.vy, 16, LOG_H-8-player.h);
+
+      // Attacks
+      if(once.get('sword')){ startSlash(); once.set('sword',false); }
+      if(once.get('boom')){ throwBoom(); once.set('boom',false); }
+
+      // Melee box placement
+      if(melee.active){
+        melee.t--; if(melee.t<=0){ melee.active=false; } else {
+          const b=melee.box; const range=12; const d=dirVec(player.face);
+          b.w = d.x!==0?12:8; b.h=d.y!==0?12:8;
+          b.x = player.x + (d.x>0?player.w: d.x<0?-range : (player.w/2-4));
+          b.y = player.y + (d.y>0?player.h: d.y<0?-range : (player.h/2-4));
+        }
+      }
+
+      // Boomerang update
+      if(boomer){
+        if(!boomer.returning){ boomer.x+=boomer.vx; boomer.y+=boomer.vy; boomer.dist+=Math.hypot(boomer.vx,boomer.vy); if(boomer.dist>=boomer.max) boomer.returning=true; }
+        if(boomer.returning){ const to={x:player.x+player.w/2, y:player.y+player.h/2}; const dx=to.x-boomer.x, dy=to.y-boomer.y; const d=Math.hypot(dx,dy)||1; boomer.vx=dx/d*2.4; boomer.vy=dy/d*2.4; boomer.x+=boomer.vx; boomer.y+=boomer.vy; if(Math.hypot(to.x-boomer.x,to.y-boomer.y)<4){ boomer=null; } }
+      }
+
+      // Enemy updates & collisions
+      const r=rooms[room];
+      for(const e of r.enemies){ if(!e.alive) continue; if(e.type==='bat'){ updateBat(e); }
+        else if(e.type==='centi'){ moveCenti(e); }
+      }
+
+      // Combat resolution
+      // Melee hits
+      if(melee.active){ for(const e of r.enemies){ if(!e.alive) continue; if(e.type==='bat'){ if(AABB(melee.box,e)){ e.hp-=10; if(e.hp<=0){ e.alive=false; dropRupee(r, e.x+e.w/2, e.y+e.h/2); } } }
+        else if(e.type==='centi'){
+          // any segment hit destroys one segment immediately
+          if(rectHitCenti(melee.box,e)) destroyCentiSeg(e);
+        }
+      } }
+
+      // Boomerang damage (pierces, can hit twice - once each way)
+      if(boomer){ 
+        for(const e of r.enemies){ 
+          if(!e.alive) continue; 
+          if(e.type==='bat'){ 
+            // Track hits per direction (0=outgoing, 1=returning)
+            const hitKey = boomer.returning ? 1 : 0;
+            const wasHit = boomer.hitIds.get(e);
+            const alreadyHitThisWay = wasHit && wasHit[hitKey];
+            
+            if(pointInRect(boomer.x,boomer.y,e) && !alreadyHitThisWay) { 
+              // Mark this hit
+              if(!wasHit) boomer.hitIds.set(e, {0:false, 1:false});
+              boomer.hitIds.get(e)[hitKey] = true;
+              
+              // Apply damage and effects
+              e.hp-=5; 
+              e.frozen=18; // 0.3 seconds at 60fps
+              e.flash=10;
+              if(e.hp<=0){ e.alive=false; dropRupee(r, e.x+e.w/2, e.y+e.h/2); } 
+            } 
+          }
+          else if(e.type==='centi'){ 
+            // For centipede, simpler approach - can hit once per throw
+            if(pointHitCenti(boomer.x,boomer.y,e) && !boomer.hitIds.has(e)) { 
+              boomer.hitIds.set(e, true);
+              e.frozen=18; // 0.3 seconds freeze
+              e.flash=10;
+              destroyCentiSeg(e); 
+            } 
+          }
+        } 
+      }
+
+      // Player vs enemy touch damage with knockback
+      if(player.inv>0) player.inv--; else {
+        for(const e of r.enemies){ if(!e.alive) continue; if(e.type==='bat'){ if(AABB(player,e)){ damagePlayerFrom(e.x+e.w/2, e.y+e.h/2); break; } }
+          else if(e.type==='centi'){
+            if(AABB(player,e.head) || e.bodies.some(s=>AABB(player,s))){ damagePlayerFrom(e.head.x+e.w/2, e.head.y+e.h/2); break; }
+          }
+        }
+      }
+
+      // Pickups
+      for(const it of r.pickups){ if(it.taken) continue; const box={x:it.x,y:it.y,w:it.w,h:it.h}; if(AABB(player,box)){
+        if(it.kind==='sword'){ player.hasSword=true; it.taken=true; }
+        else if(it.kind==='boom'){ player.hasBoom=true; it.taken=true; }
+        else if(it.kind==='heart'){ if(player.hp<30){ player.hp=clamp(player.hp+10,0,30); it.taken=true; } }
+      } }
+
+      // doors
+      for(const d of r.doors){ const box={x:d.x,y:d.y,w:d.w,h:d.h}; if(AABB(player,box)){
+        // begin scroll; player disappears
+        beginTransition(d.to, d.dir);
+        break;
+      } }
+
+      // Rupees update & collection
+      updateRupees(r);
+    }
+
+    // Death & reset
+    if(player.hp<=0){ // reset: send back to room 1, restore hp, respawn enemies; keep pickups acquired
+      player.hp=30; room=ROOM.START; player.x=112; player.y=120; player.face='down'; player.inv=0; boomer=null; resetRooms();
+      // keep items that were taken
+      if(player.hasSword) rooms[ROOM.START].pickups.forEach(p=>{ if(p.kind==='sword') p.taken=true; });
+      if(player.hasBoom) rooms[ROOM.GREY].pickups.forEach(p=>{ if(p.kind==='boom') p.taken=true; });
+    }
+
+    // === Render ===
+    if(!renderTransition(dt)){
+      drawRoomBG(rooms[room]);
+      drawPickups(rooms[room]);
+      drawEnemies(rooms[room]);
+      drawRupees(rooms[room]);
+      drawBoom();
+      drawMelee();
+      drawPlayer();
+    }
+    drawHUD();
+    drawRain();
+
+    requestAnimationFrame(loop);
+  }
+
+  function rectHitCenti(rect, c){ if(AABB(rect, c.head)) return true; for(const s of c.bodies){ if(AABB(rect,s)) return true; } return false; }
+  function pointHitCenti(x,y,c){ const pt={x:x-1,y:y-1,w:2,h:2}; return rectHitCenti(pt,c); }
+  function destroyCentiSeg(c){ 
+    if(!c.alive) return; 
+    if(c.bodies.length>0){ 
+      c.bodies.pop(); 
+      c.segs--; 
+      // Speed up by 15% for each lost segment
+      c.speed = c.baseSpeed * (1 + 0.15 * (4 - c.segs));
+    } else { 
+      // head dies
+      c.alive=false; 
+      dropRupee(rooms[room], c.head.x+c.w/2, c.head.y+c.h/2); 
+      
+      // Trigger victory effect in throne room
+      if (room === ROOM.THRONE) {
+        victoryLight = 1.0;
+        rooms[ROOM.THRONE].rain = false;
+        rooms[ROOM.THRONE].lightning = false;
+      }
+    }
+  }
+
+  function dropRupee(r, x,y){ 
+    // Simple drop - no gravity, just slightly randomize position
+    r.rupees.push({
+      x:x-4+rng(-2,2), 
+      y:y-6+rng(-2,2), 
+      w:8, 
+      h:12, 
+      collected:false
+    }); 
+  }
+
+  function updateRupees(r){ 
+    for(const g of r.rupees){ 
+      // No physics - rupees just stay where they dropped
+      // pickup check
+      if(AABB(player,g)){ 
+        inventory.rupees++; 
+        g.collected=true; 
+      }
+    } 
+    // Remove collected rupees
+    for(let i=r.rupees.length-1;i>=0;i--) {
+      if(r.rupees[i].collected) r.rupees.splice(i,1);
+    }
+  }
+
+  function pointInRect(x,y,r){ return x>=r.x && x<=r.x+r.w && y>=r.y && y<=r.y+r.h; }
+
+  function damagePlayerFrom(sx,sy){ player.hp-=10; player.inv=60; const dx=player.x+player.w/2 - sx; const dy=player.y+player.h/2 - sy; const d=Math.hypot(dx,dy)||1; const k=2.2; player.x = clamp(player.x + (dx/d)*k*8, 8, LOG_W-8-player.w); player.y= clamp(player.y + (dy/d)*k*8, 16, LOG_H-8-player.h); }
+
+  // Main loop kick - start immediately
+  requestAnimationFrame(loop);
+
+})();
+</script>
+</body>
+</html>
