@@ -1,0 +1,606 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Featherfall — Kid Icarus‑inspired</title>
+  <style>
+    :root {
+      --bg: #0e0e10;
+      --hud: #e5e5e5;
+      --accent: #7cf;
+      --accent2: #f7a;
+      --platform: #2b3348;
+      --platform2: #3a4564;
+      --player: #eec;
+      --enemy1: #f55;
+      --enemy2: #f9b84e;
+      --arrow: #fff6a0;
+      --pickup1: #8df58d; /* double jump orb */
+      --pickup2: #cfa7ff; /* range up quiver */
+    }
+
+    html, body {
+      height: 100%;
+      margin: 0;
+      background: radial-gradient(1000px 600px at 15% -10%, #1b1b22 0%, #0c0c0f 60%, #000 100%);
+      color: var(--hud);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+    }
+
+    .wrap {
+      height: 100%;
+      display: grid;
+      place-items: center;
+      gap: 1rem;
+      padding: 1rem;
+    }
+
+    .frame {
+      position: relative;
+      width: min(96vw, 1280px);
+      max-width: 1280px;
+      aspect-ratio: 16/9;
+      box-shadow: 0 25px 60px rgba(0,0,0,.6), inset 0 0 0 2px rgba(255,255,255,.06);
+      border-radius: 18px;
+      overflow: hidden;
+      background: #0a0a0d;
+    }
+
+    canvas {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      image-rendering: pixelated;
+      image-rendering: crisp-edges;
+      display: block;
+    }
+
+    .hud {
+      position: absolute;
+      left: 12px;
+      top: 10px;
+      font-size: clamp(12px, 1.7vw, 16px);
+      line-height: 1.25;
+      text-shadow: 0 2px 0 #000, 0 0 6px rgba(0,0,0,.6);
+      user-select: none;
+      pointer-events: none;
+    }
+
+    .legend {
+      position: absolute;
+      right: 12px;
+      top: 10px;
+      font-size: clamp(11px, 1.4vw, 14px);
+      color: #cfd8ff;
+      opacity: .9;
+      text-align: right;
+      text-shadow: 0 2px 0 #000, 0 0 6px rgba(0,0,0,.6);
+      user-select: none;
+    }
+
+    .badge {
+      display: inline-block;
+      padding: .1rem .45rem;
+      border-radius: 6px;
+      background: rgba(255,255,255,.08);
+      box-shadow: inset 0 0 0 1px rgba(255,255,255,.15);
+      margin-left: .35rem;
+    }
+
+    .title {
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      transform: translate(-50%, -50%);
+      font-size: clamp(20px, 5vw, 42px);
+      letter-spacing: .04em;
+      color: #cfe9ff;
+      text-shadow: 0 6px 0 #000, 0 0 32px rgba(124,200,255,.35);
+      pointer-events: none;
+      opacity: .12;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="frame" id="frame">
+      <canvas id="game" aria-label="Featherfall game canvas"></canvas>
+      <canvas id="rain" aria-hidden="true"></canvas>
+      <div class="hud" id="hud"></div>
+      <div class="legend" id="legend">
+        <div><strong>Featherfall</strong> <span class="badge">pixel‑art prototype</span></div>
+        <div>Move: <b>A / D</b> or <b>◀ / ▶</b></div>
+        <div>Jump: <b>Z</b> / <b>Space</b> / <b>▲</b></div>
+        <div>Shoot: <b>X</b> / <b>K</b></div>
+        <div>Toggle rain: <b>R</b> · Toggle HUD: <b>H</b></div>
+      </div>
+      <div class="title">FEATHERFALL</div>
+    </div>
+  </div>
+
+<script>
+(() => {
+  // ======= Config =======
+  const LOGICAL_W = 320;   // internal resolution (pixels)
+  const LOGICAL_H = 180;
+  const SCALE_FIT = true;  // canvas autoscale to frame
+
+  const G = 0.45;          // gravity
+  const FRICTION = 0.82;   // ground friction
+  const AIR_DRAG = 0.98;   // in‑air friction
+
+  // Player feel
+  const RUN_ACCEL = 0.9;
+  const MAX_RUN = 2.4;
+  const JUMP_V = 7.0;      // base jump impulse
+  const DJUMP_V = 7.2;     // double jump impulse (slightly punchier)
+
+  // Arrows
+  const ARROW_SPEED = 4.2;
+  const ARROW_BASE_RANGE = 130; // in logical px
+  const ARROW_LIMIT = 2;        // at most 2 on screen
+
+  // World bounds
+  const WORLD = { w: 2400, h: 1200, floor: 9999 };
+
+  // ======= Canvas setup =======
+  const game = document.getElementById('game');
+  const rain = document.getElementById('rain');
+  const frame = document.getElementById('frame');
+  const hudEl = document.getElementById('hud');
+  const legendEl = document.getElementById('legend');
+
+  function resize() {
+    // Fit logical canvas to the frame while preserving 16:9
+    const rect = frame.getBoundingClientRect();
+    game.width = LOGICAL_W;
+    game.height = LOGICAL_H;
+    rain.width = LOGICAL_W;
+    rain.height = LOGICAL_H;
+    // CSS sizing handled by .frame aspect ratio (already fills)
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  const ctx = game.getContext('2d');
+  const rtx = rain.getContext('2d');
+
+  // ======= Helpers =======
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  const AABB = (a, b) => (
+    a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y
+  );
+
+  // ======= Input =======
+  const keys = new Map();
+  const once = new Map();
+  const mapKey = (code) => (
+    code === 'ArrowLeft' || code === 'KeyA' ? 'left'
+    : code === 'ArrowRight' || code === 'KeyD' ? 'right'
+    : code === 'Space' || code === 'KeyZ' || code === 'ArrowUp' ? 'jump'
+    : code === 'KeyX' || code === 'KeyK' ? 'shoot'
+    : code === 'KeyR' ? 'rain'
+    : code === 'KeyH' ? 'hud'
+    : null
+  );
+  window.addEventListener('keydown', (e) => {
+    const k = mapKey(e.code);
+    if (!k) return;
+    if (k === 'rain' || k === 'hud') {
+      once.set(k, true); // edge‑triggered toggles
+    } else {
+      if (!keys.get(k)) once.set(k, true); // edge detect for jump/shoot
+      keys.set(k, true);
+    }
+    e.preventDefault();
+  });
+  window.addEventListener('keyup', (e) => {
+    const k = mapKey(e.code);
+    if (!k) return;
+    keys.set(k, false);
+    e.preventDefault();
+  });
+
+  // ======= World geometry =======
+  /** Platforms are simple rectangles */
+  const platforms = [];
+  const addPlat = (x,y,w,h) => platforms.push({x,y,w,h});
+
+  // Ground & terraces (mix of side + vertical paths)
+  addPlat(-200, 150, 800, 40);   // long ground left
+  addPlat(620, 150, 600, 40);    // long ground right
+  addPlat(1250, 150, 450, 40);
+  addPlat(1750, 150, 600, 40);
+
+  addPlat(160, 110, 120, 12);
+  addPlat(320, 80, 90, 12);
+  addPlat(460, 50, 100, 12);
+  addPlat(620, 100, 80, 12);
+
+  // Vertical ascent
+  addPlat(820, 120, 60, 12);
+  addPlat(900, 90, 60, 12);
+  addPlat(980, 55, 60, 12);
+  addPlat(1060, 20, 60, 12);
+  addPlat(1140, -10, 60, 12);
+  addPlat(1220, -45, 60, 12);
+  addPlat(1300, -80, 70, 12);
+  addPlat(1400, -110, 80, 12);
+  addPlat(1500, -140, 90, 12);
+  addPlat(1620, -110, 80, 12);
+  addPlat(1730, -70, 80, 12);
+  addPlat(1820, -30, 80, 12);
+
+  // Upper stretch
+  addPlat(1880, 10, 160, 12);
+  addPlat(2050, -25, 150, 12);
+  addPlat(2230, -60, 140, 12);
+
+  // ======= Entities =======
+  const player = {
+    x: 30, y: 80, w: 12, h: 16,
+    vx: 0, vy: 0,
+    facing: 1,
+    onGround: false,
+    canDouble: false, // unlocked via pickup
+    jumpsUsed: 0,
+    alive: true,
+    spawn: { x: 30, y: 80 },
+    rangeBonus: 0 // increases arrow range via pickup
+  };
+
+  const enemies = [];
+  function makeEnemy(x, y, type = 'patroller', dir = 1) {
+    return { x, y, w: 12, h: 14, vx: 1.0 * dir, vy: 0, type, alive: true };
+  }
+  // Populate enemies
+  enemies.push(
+    makeEnemy(260, 96, 'patroller', -1),
+    makeEnemy(340, 36, 'walker', 1),
+    makeEnemy(700, 136, 'patroller', 1),
+    makeEnemy(940, 80, 'walker', 1),
+    makeEnemy(1420, -124, 'patroller', -1),
+    makeEnemy(1800, 136, 'walker', 1),
+  );
+
+  // Pickups
+  const pickups = [];
+  const addPickup = (x, y, kind) => pickups.push({ x, y, w: 10, h: 10, kind, taken: false });
+  addPickup(500, 30, 'double');     // unlock double jump
+  addPickup(1700, -120, 'range');   // increase arrow range
+
+  // Projectiles
+  const arrows = [];
+
+  // HUD state
+  let kills = 0;
+  let showHUD = true;
+  let rainOn = true;
+
+  // Camera
+  const camera = { x: 0, y: 0 };
+
+  // ======= Physics & collisions =======
+  function applyPlatforms(entity, isPlayer = false, enemyType = null) {
+    // Horizontal move & resolve
+    entity.x += entity.vx;
+    for (const p of platforms) {
+      if (AABB(entity, p)) {
+        if (entity.vx > 0) entity.x = p.x - entity.w;
+        else if (entity.vx < 0) entity.x = p.x + p.w;
+        entity.vx = 0;
+        // Patrollers flip on side bump
+        if (enemyType === 'patroller') entity.vx = -1.0 * Math.sign(entity.facing || 1);
+      }
+    }
+
+    // Vertical move & resolve
+    entity.vy += G;
+    entity.y += entity.vy;
+
+    let grounded = false;
+    for (const p of platforms) {
+      if (AABB(entity, p)) {
+        if (entity.vy > 0) { // falling
+          entity.y = p.y - entity.h;
+          entity.vy = 0;
+          grounded = true;
+        } else if (entity.vy < 0) { // hitting head
+          entity.y = p.y + p.h;
+          entity.vy = 0;
+        }
+      }
+    }
+
+    if (isPlayer) {
+      player.onGround = grounded;
+      if (grounded) player.jumpsUsed = 0; // reset jump counter on landing
+    }
+    return grounded;
+  }
+
+  function groundAhead(e, dir) {
+    // Probe 2px ahead at feet level to detect platform edge for patrollers
+    const probe = { x: e.x + (dir > 0 ? e.w + 2 : -2), y: e.y + e.h + 1, w: 2, h: 2 };
+    for (const p of platforms) {
+      if (AABB(probe, p)) return true;
+    }
+    return false;
+  }
+
+  // ======= Rain overlay =======
+  const drops = [];
+  function initRain() {
+    drops.length = 0;
+    const n = 120; // number of streaks
+    for (let i = 0; i < n; i++) {
+      drops.push({
+        x: Math.random() * LOGICAL_W,
+        y: Math.random() * LOGICAL_H,
+        len: 8 + Math.random() * 8,
+        spd: 2 + Math.random() * 2.5,
+      });
+    }
+  }
+  initRain();
+
+  function drawRain(dt) {
+    if (!rainOn) {
+      rtx.clearRect(0,0,LOGICAL_W,LOGICAL_H);
+      return;
+    }
+    rtx.clearRect(0,0,LOGICAL_W,LOGICAL_H);
+    rtx.globalAlpha = 0.65;
+    rtx.strokeStyle = 'rgba(160,200,255,0.8)';
+    rtx.lineWidth = 1;
+    rtx.beginPath();
+    for (const d of drops) {
+      rtx.moveTo(d.x, d.y);
+      rtx.lineTo(d.x - 2, d.y + d.len);
+      d.x -= 0.8 * d.spd * dt;
+      d.y += d.spd * dt;
+      if (d.y > LOGICAL_H + 10) { d.y = -10; d.x = Math.random() * LOGICAL_W; }
+      if (d.x < -10) { d.x = LOGICAL_W + 10; }
+    }
+    rtx.stroke();
+    rtx.globalAlpha = 1;
+  }
+
+  // ======= Rendering =======
+  function clearGame() {
+    // night‑sky gradient parallax-ish background
+    const g = ctx.createLinearGradient(0, 0, 0, LOGICAL_H);
+    g.addColorStop(0, '#081019');
+    g.addColorStop(1, '#02040a');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, LOGICAL_W, LOGICAL_H);
+  }
+
+  function drawWorld() {
+    // Platforms
+    for (const p of platforms) {
+      const x = Math.floor(p.x - camera.x);
+      const y = Math.floor(p.y - camera.y);
+      ctx.fillStyle = '#1b2133';
+      ctx.fillRect(x, y, p.w, p.h);
+      ctx.fillStyle = '#29324a';
+      ctx.fillRect(x+1, y+1, p.w-2, p.h-2);
+    }
+  }
+
+  function drawPlayer() {
+    const x = Math.floor(player.x - camera.x);
+    const y = Math.floor(player.y - camera.y);
+    // Simple pixel avatar with bow arm
+    ctx.fillStyle = '#2b2b2b'; // outline
+    ctx.fillRect(x-1, y-1, player.w+2, player.h+2);
+    ctx.fillStyle = '#e4dfc1';
+    ctx.fillRect(x, y, player.w, player.h);
+    // headband / accent
+    ctx.fillStyle = '#89d3ff';
+    ctx.fillRect(x+2, y+2, player.w-4, 2);
+    // bow line
+    ctx.fillStyle = '#d9c27a';
+    if (player.facing > 0) ctx.fillRect(x+player.w-2, y+4, 2, 8);
+    else ctx.fillRect(x, y+4, 2, 8);
+  }
+
+  function drawEnemies() {
+    for (const e of enemies) if (e.alive) {
+      const x = Math.floor(e.x - camera.x);
+      const y = Math.floor(e.y - camera.y);
+      ctx.fillStyle = e.type === 'patroller' ? '#f66' : '#ffb74d';
+      ctx.fillRect(x, y, e.w, e.h);
+      // tiny eyes
+      ctx.fillStyle = '#000';
+      ctx.fillRect(x+3, y+4, 2, 2);
+    }
+  }
+
+  function drawArrows() {
+    ctx.fillStyle = '#fff6a0';
+    for (const a of arrows) {
+      const x = Math.floor(a.x - camera.x);
+      const y = Math.floor(a.y - camera.y);
+      ctx.fillRect(x, y+4, 8, 2);
+    }
+  }
+
+  function drawPickups() {
+    for (const it of pickups) if (!it.taken) {
+      const x = Math.floor(it.x - camera.x);
+      const y = Math.floor(it.y - camera.y);
+      if (it.kind === 'double') {
+        ctx.fillStyle = 'rgba(140,245,140,0.2)';
+        ctx.fillRect(x-2, y-2, it.w+4, it.h+4);
+        ctx.fillStyle = '#8df58d';
+        ctx.fillRect(x, y, it.w, it.h);
+      } else {
+        ctx.fillStyle = 'rgba(207,167,255,0.2)';
+        ctx.fillRect(x-2, y-2, it.w+4, it.h+4);
+        ctx.fillStyle = '#cfa7ff';
+        ctx.fillRect(x, y, it.w, it.h);
+      }
+    }
+  }
+
+  function drawHUD() {
+    if (!showHUD) { hudEl.innerHTML = ''; return; }
+    const rainTxt = rainOn ? 'ON' : 'OFF';
+    const range = ARROW_BASE_RANGE + player.rangeBonus;
+    hudEl.innerHTML = `Kills: <b>${kills}</b> · Arrows: <b>${Math.min(ARROW_LIMIT, Math.max(0, ARROW_LIMIT - arrows.length))}</b>` +
+      `<br>Double Jump: <b>${player.canDouble ? 'UNLOCKED' : '—'}</b>` +
+      `<br>Arrow Range: <b>${range}px</b> <span class="badge">Upgrades improve distance</span>` +
+      `<br>Rain: <b>${rainTxt}</b>`;
+  }
+
+  // ======= Game update =======
+  let last = performance.now();
+  function loop(now) {
+    const dt = clamp((now - last) / (1000/60), 0.5, 2.0); // normalize to ~60fps units
+    last = now;
+
+    // Toggles
+    if (once.get('rain')) { rainOn = !rainOn; once.set('rain', false); }
+    if (once.get('hud')) { showHUD = !showHUD; once.set('hud', false); }
+
+    // Player control
+    const wantLeft = !!keys.get('left');
+    const wantRight = !!keys.get('right');
+    const wantJump = !!keys.get('jump');
+
+    // Horizontal
+    if (wantLeft) { player.vx -= RUN_ACCEL; player.facing = -1; }
+    if (wantRight) { player.vx += RUN_ACCEL; player.facing = 1; }
+    if (!wantLeft && !wantRight) player.vx *= player.onGround ? FRICTION : AIR_DRAG;
+    player.vx = clamp(player.vx, -MAX_RUN, MAX_RUN);
+
+    // Jump (debounced on keydown only)
+    if (once.get('jump')) {
+      if (player.onGround) {
+        player.vy = -JUMP_V;
+        player.onGround = false;
+        player.jumpsUsed = 0;
+      } else if (player.canDouble && player.jumpsUsed === 0) {
+        player.vy = -DJUMP_V;
+        player.jumpsUsed = 1; // consume double jump
+      }
+      once.set('jump', false);
+    }
+
+    // Shoot (limit arrows on screen)
+    if (once.get('shoot')) {
+      if (arrows.length < ARROW_LIMIT) {
+        const dir = player.facing;
+        const range = ARROW_BASE_RANGE + player.rangeBonus;
+        arrows.push({
+          x: player.x + (dir > 0 ? player.w : -8),
+          y: player.y + 4,
+          vx: ARROW_SPEED * dir,
+          max: range,
+          dist: 0,
+          alive: true,
+        });
+      }
+      once.set('shoot', false);
+    }
+
+    // Integrate player with world
+    applyPlatforms(player, true);
+
+    // Enemies AI & physics
+    for (const e of enemies) if (e.alive) {
+      // Orient facing from velocity (for side bumps flip behavior)
+      e.facing = e.vx >= 0 ? 1 : -1;
+
+      if (e.type === 'patroller') {
+        // Reverse if no ground ahead
+        const dir = Math.sign(e.vx) || 1;
+        if (!groundAhead(e, dir)) e.vx = -e.vx;
+        e.vx = clamp(e.vx, -1.2, 1.2);
+      } else {
+        // Walker keeps going; clamp speed
+        e.vx = clamp(e.vx, -1.2, 1.2);
+      }
+
+      applyPlatforms(e, false, e.type);
+
+      // Despawn off-screen bottom
+      if (e.y - camera.y > LOGICAL_H + 200) e.alive = false;
+
+      // Touch damage to player
+      if (player.alive && e.alive && AABB(player, e)) {
+        respawnPlayer();
+        break;
+      }
+    }
+
+    // Projectiles
+    for (const a of arrows) if (a.alive) {
+      a.x += a.vx;
+      a.dist += Math.abs(a.vx);
+      // Collide with platforms
+      for (const p of platforms) {
+        if (a.x + 8 > p.x && a.x < p.x + p.w && a.y + 2 > p.y && a.y < p.y + p.h) {
+          a.alive = false;
+        }
+      }
+      if (a.dist >= a.max) a.alive = false;
+
+      // Hit enemies
+      for (const e of enemies) if (e.alive) {
+        if (a.x < e.x + e.w && a.x + 8 > e.x && a.y < e.y + e.h && a.y + 2 > e.y) {
+          e.alive = false;
+          a.alive = false;
+          kills += 1;
+        }
+      }
+    }
+
+    // Cleanup dead projectiles/enemies
+    for (let i = arrows.length - 1; i >= 0; --i) if (!arrows[i].alive) arrows.splice(i, 1);
+
+    // Pickups
+    for (const it of pickups) if (!it.taken) {
+      if (AABB(player, it)) {
+        if (it.kind === 'double') player.canDouble = true;
+        else if (it.kind === 'range') player.rangeBonus += 90;
+        it.taken = true;
+      }
+    }
+
+    // Camera follow
+    camera.x = clamp(player.x + player.w/2 - LOGICAL_W/2, -220, WORLD.w - LOGICAL_W + 220);
+    camera.y = clamp(player.y + player.h/2 - LOGICAL_H/2, -300, WORLD.h - LOGICAL_H + 300);
+
+    // === Draw ===
+    clearGame();
+    drawWorld();
+    drawPickups();
+    drawEnemies();
+    drawArrows();
+    drawPlayer();
+    drawHUD();
+    drawRain(dt);
+
+    requestAnimationFrame(loop);
+  }
+
+  function respawnPlayer() {
+    // Simple respawn to spawn point, keep KOs count
+    player.x = player.spawn.x;
+    player.y = player.spawn.y;
+    player.vx = player.vy = 0;
+    player.jumpsUsed = 0;
+  }
+
+  // Prime input one-shot flags (so the first tap works)
+  ['jump','shoot','rain','hud'].forEach(k => once.set(k, false));
+
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>

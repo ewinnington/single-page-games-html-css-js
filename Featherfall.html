@@ -1,0 +1,680 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Featherfall — A Tiny Kid Icarus-inspired Scroller</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<style>
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: #0e0f14;
+    color: #eaeaea;
+    font-family: monospace;
+    overflow: hidden;
+  }
+  #ui {
+    position: fixed;
+    left: 10px;
+    top: 10px;
+    z-index: 10;
+    background: rgba(0,0,0,0.4);
+    padding: 8px 10px;
+    border: 1px solid #333;
+    border-radius: 4px;
+    user-select: none;
+  }
+  #ui .title {
+    font-weight: bold;
+    color: #ffd35a;
+    margin-bottom: 6px;
+  }
+  #ui .row { margin: 2px 0; }
+  #ui .muted { color: #a8a8a8; font-size: 12px; }
+
+  canvas {
+    display: block;
+    width: 100vw;
+    height: 100vh;
+    image-rendering: pixelated;
+    image-rendering: crisp-edges;
+    background: linear-gradient(#0d0f1a, #141826 45%, #0d0f1a 100%);
+  }
+
+  /* Pixel-style outlines for items and actors */
+  .legend {
+    position: fixed;
+    right: 10px;
+    top: 10px;
+    z-index: 10;
+    background: rgba(0,0,0,0.35);
+    padding: 6px 8px;
+    border: 1px solid #333;
+    border-radius: 4px;
+    font-size: 12px;
+  }
+  .legend .chip { display:inline-block; width:12px; height:12px; margin-right:6px; vertical-align:middle; border:1px solid #000; }
+</style>
+</head>
+<body>
+<div id="ui">
+  <div class="title">Featherfall</div>
+  <div class="row">Kills: <span id="kills">0</span></div>
+  <div class="row">Double Jump: <span id="dj">No</span></div>
+  <div class="row">Arrow Range: <span id="range">Short</span></div>
+  <div class="row muted">
+    Move: A/D or Arrows | Jump: W/Up/Space | Shoot: J/K/X/Z | Toggle Rain: R
+  </div>
+</div>
+<div class="legend">
+  <div><span class="chip" style="background:#59c3ff;border-color:#1a3c5a"></span>Hero</div>
+  <div><span class="chip" style="background:#ff6b6b;border-color:#5a1a1a"></span>Patroller</div>
+  <div><span class="chip" style="background:#ff9f43;border-color:#5a3a1a"></span>Lurker (walks off)</div>
+  <div><span class="chip" style="background:#ffe66d;border-color:#5a531a"></span>Feather (Double Jump)</div>
+  <div><span class="chip" style="background:#c792ea;border-color:#3a1a5a"></span>Quiver (Range Up)</div>
+  <div><span class="chip" style="background:#a0ffa0;border-color:#1a5a1a"></span>Platform</div>
+</div>
+<canvas id="game" width="960" height="540"></canvas>
+
+<script>
+(function() {
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d', { alpha: false });
+  ctx.imageSmoothingEnabled = false;
+
+  const uiKills = document.getElementById('kills');
+  const uiDJ = document.getElementById('dj');
+  const uiRange = document.getElementById('range');
+
+  function resize() {
+    // Use a fixed internal resolution for consistent physics, scale with CSS
+    const ratio = 16/9;
+    let w = window.innerWidth;
+    let h = window.innerHeight;
+    if (w / h > ratio) {
+      w = Math.floor(h * ratio);
+    } else {
+      h = Math.floor(w / ratio);
+    }
+    canvas.style.width = w + 'px';
+    canvas.style.height = h + 'px';
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  // World / Camera
+  const WORLD = {
+    w: 4000,
+    h: 2400,
+    gravity: 0.7,
+    friction: 0.85,
+  };
+
+  const VIEW = { x: 0, y: 0, w: canvas.width, h: canvas.height };
+
+  // Input
+  const keysDown = new Set();
+  function isJumpKey(k) { return k === ' ' || k === 'w' || k === 'ArrowUp'; }
+  function isLeftKey(k) { return k === 'a' || k === 'ArrowLeft'; }
+  function isRightKey(k) { return k === 'd' || k === 'ArrowRight'; }
+  function isShootKey(k) { return k === 'j' || k === 'k' || k === 'x' || k === 'z'; }
+
+  // Entities
+  function aabb(a,b) {
+    return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+  }
+
+  class Platform {
+    constructor(x,y,w,h) { this.x=x; this.y=y; this.w=w; this.h=h; }
+    draw() {
+      ctx.fillStyle = '#a0ffa0';
+      ctx.fillRect(Math.floor(this.x - VIEW.x), Math.floor(this.y - VIEW.y), this.w, this.h);
+      ctx.fillStyle = 'rgba(0,0,0,0.2)';
+      ctx.fillRect(Math.floor(this.x - VIEW.x), Math.floor(this.y - VIEW.y + this.h - 3), this.w, 3);
+    }
+  }
+
+  class Item {
+    // type: 'doublejump' | 'range'
+    constructor(type, x, y) {
+      this.type = type;
+      this.x = x; this.y = y;
+      this.w = 22; this.h = 22;
+      this.pulse = 0;
+      this.taken = false;
+    }
+    draw() {
+      if (this.taken) return;
+      const sx = Math.floor(this.x - VIEW.x);
+      const sy = Math.floor(this.y - VIEW.y);
+      if (this.type === 'doublejump') {
+        ctx.fillStyle = '#ffe66d';
+        ctx.fillRect(sx, sy, this.w, this.h);
+        ctx.strokeStyle = '#5a531a';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(sx+0.5, sy+0.5, this.w-1, this.h-1);
+        // Feather motif
+        ctx.fillStyle = '#fff6a0';
+        ctx.fillRect(sx+6, sy+5 + Math.sin(this.pulse)*2, 10, 2);
+        ctx.fillRect(sx+8, sy+9 + Math.sin(this.pulse+1)*2, 8, 2);
+      } else {
+        ctx.fillStyle = '#c792ea';
+        ctx.fillRect(sx, sy, this.w, this.h);
+        ctx.strokeStyle = '#3a1a5a';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(sx+0.5, sy+0.5, this.w-1, this.h-1);
+        // Quiver motif
+        ctx.fillStyle = '#e4c5ff';
+        ctx.fillRect(sx+6, sy+5 + Math.sin(this.pulse)*2, 10, 12);
+      }
+    }
+    update(dt) {
+      if (!this.taken) {
+        this.pulse += dt * 6;
+      }
+    }
+  }
+
+  class Arrow {
+    constructor(x, y, dir, range) {
+      this.x = x; this.y = y; this.w = 12; this.h = 3;
+      this.dir = dir;
+      this.speed = 9 * dir;
+      this.range = range; // pixels remaining
+      this.dead = false;
+    }
+    update(dt) {
+      const dx = this.speed * (dt * 60);
+      this.x += dx;
+      this.range -= Math.abs(dx);
+      if (this.range <= 0) this.dead = true;
+      // collide with platforms
+      for (const p of platforms) {
+        if (aabb(this, p)) {
+          this.dead = true;
+          break;
+        }
+      }
+    }
+    draw() {
+      const sx = Math.floor(this.x - VIEW.x);
+      const sy = Math.floor(this.y - VIEW.y);
+      ctx.fillStyle = '#ffd35a';
+      ctx.fillRect(sx, sy, this.w, this.h);
+      // simple arrowhead
+      ctx.fillStyle = '#fff7c2';
+      if (this.dir > 0) ctx.fillRect(sx + this.w - 2, sy - 1, 2, this.h + 2);
+      else ctx.fillRect(sx - 0, sy - 1, 2, this.h + 2);
+    }
+  }
+
+  class Enemy {
+    // type: 'patrol' or 'walker' (walker goes straight and falls)
+    constructor(type, x, y) {
+      this.type = type;
+      this.x = x; this.y = y;
+      this.w = 26; this.h = 26;
+      this.vx = (Math.random()<0.5?-1:1) * (1.2 + Math.random()*0.5);
+      this.vy = 0;
+      this.onGround = false;
+      this.dead = false;
+      this.dir = Math.sign(this.vx) || 1;
+    }
+    update(dt) {
+      // gravity
+      this.vy += WORLD.gravity * (dt * 60);
+      // Horizontal behavior
+      if (this.type === 'patrol') {
+        // Edge detection: if about to leave the platform, reverse
+        // Check one pixel ahead and one pixel down from feet
+        const ahead = this.x + (this.dir > 0 ? this.w + 1 : -1);
+        const footY = this.y + this.h + 2;
+        let groundAhead = false;
+        for (const p of platforms) {
+          if (ahead >= p.x && ahead <= p.x + p.w &&
+              footY >= p.y && footY <= p.y + p.h) {
+            groundAhead = true; break;
+          }
+        }
+        if (!groundAhead && this.onGround) {
+          this.dir *= -1;
+          this.vx = Math.abs(this.vx) * this.dir;
+        }
+      } else {
+        // walker: keep going straight, no reversing
+        this.vx = Math.abs(this.vx) * this.dir;
+      }
+
+      // Integrate X with simple collision
+      this.x += this.vx * (dt * 60);
+      for (const p of platforms) {
+        if (aabb(this, p)) {
+          if (this.vx > 0) this.x = p.x - this.w;
+          else if (this.vx < 0) this.x = p.x + p.w;
+          this.vx *= -1;
+          this.dir = Math.sign(this.vx) || this.dir;
+        }
+      }
+
+      // Integrate Y with collision and ground detection
+      this.onGround = false;
+      this.y += this.vy * (dt * 60);
+      for (const p of platforms) {
+        if (aabb(this, p)) {
+          if (this.vy > 0) { // falling, hit top
+            this.y = p.y - this.h;
+            this.vy = 0;
+            this.onGround = true;
+          } else if (this.vy < 0) { // moving up, hit bottom
+            this.y = p.y + p.h;
+            this.vy = 0;
+          }
+        }
+      }
+
+      // off-screen cleanup
+      if (this.y > WORLD.h + 200 || this.x < -200 || this.x > WORLD.w + 200) {
+        this.dead = true;
+      }
+    }
+    draw() {
+      const sx = Math.floor(this.x - VIEW.x);
+      const sy = Math.floor(this.y - VIEW.y);
+      if (this.type === 'patrol') {
+        ctx.fillStyle = '#ff6b6b';
+        ctx.fillRect(sx, sy, this.w, this.h);
+        ctx.strokeStyle = '#5a1a1a';
+      } else {
+        ctx.fillStyle = '#ff9f43';
+        ctx.fillRect(sx, sy, this.w, this.h);
+        ctx.strokeStyle = '#5a3a1a';
+      }
+      ctx.lineWidth = 2;
+      ctx.strokeRect(sx+0.5, sy+0.5, this.w-1, this.h-1);
+      // eyes
+      ctx.fillStyle = '#0d0f14';
+      ctx.fillRect(sx + (this.dir>0?15:7), sy+8, 4, 4);
+    }
+  }
+
+  class Player {
+    constructor() {
+      this.spawnX = 80;
+      this.spawnY = WORLD.h - 250;
+      this.x = this.spawnX; this.y = this.spawnY;
+      this.w = 24; this.h = 28;
+      this.vx = 0; this.vy = 0;
+      this.onGround = false;
+      this.dir = 1;
+      this.speed = 3.2;
+      this.jumpVel = -22.5; // good feel jump
+      this.jumpsLeft = 1;
+      this.hasDouble = false;
+      this.hasRangeUp = false;
+      this.invuln = 0;
+      this.deadTimer = 0;
+    }
+    resetForGround() {
+      this.jumpsLeft = this.hasDouble ? 2 : 1;
+    }
+    tryJump() {
+      if (this.jumpsLeft > 0) {
+        this.vy = this.jumpVel;
+        this.onGround = false;
+        this.jumpsLeft--;
+      }
+    }
+    shoot() {
+      // limit to 2 arrows on screen
+      let active = 0;
+      for (const a of arrows) if (!a.dead) active++;
+      if (active >= 2) return;
+      const range = this.hasRangeUp ? 520 : 300;
+      const yCenter = this.y + this.h/2 - 1;
+      const xStart = this.dir > 0 ? (this.x + this.w + 2) : (this.x - 14);
+      arrows.push(new Arrow(xStart, yCenter, this.dir, range));
+    }
+    update(dt) {
+      if (this.deadTimer > 0) {
+        this.deadTimer -= dt;
+        if (this.deadTimer <= 0) this.respawn();
+        return;
+      }
+      if (this.invuln > 0) this.invuln -= dt;
+
+      // Horizontal input
+      let left = keysDown.has('a') || keysDown.has('ArrowLeft');
+      let right = keysDown.has('d') || keysDown.has('ArrowRight');
+      if (left && !right) {
+        this.vx -= this.speed * (dt * 60) * 0.6;
+        this.dir = -1;
+      } else if (right && !left) {
+        this.vx += this.speed * (dt * 60) * 0.6;
+        this.dir = 1;
+      } else {
+        // friction
+        this.vx *= 0.85;
+        if (Math.abs(this.vx) < 0.05) this.vx = 0;
+      }
+      // clamp horizontal velocity
+      this.vx = Math.max(Math.min(this.vx, 6), -6);
+
+      // Gravity
+      this.vy += WORLD.gravity * (dt * 60);
+      // Integrate X with collision
+      this.x += this.vx;
+      for (const p of platforms) {
+        if (aabb(this, p)) {
+          if (this.vx > 0) this.x = p.x - this.w;
+          else if (this.vx < 0) this.x = p.x + p.w;
+          this.vx = 0;
+        }
+      }
+
+      // Integrate Y with collision
+      this.onGround = false;
+      this.y += this.vy;
+      for (const p of platforms) {
+        if (aabb(this, p)) {
+          if (this.vy > 0) { // falling onto top
+            this.y = p.y - this.h;
+            this.vy = 0;
+            if (!this.onGround) {
+              this.onGround = true;
+              this.resetForGround();
+            }
+          } else if (this.vy < 0) { // hit head
+            this.y = p.y + p.h;
+            this.vy = 0;
+          }
+        }
+      }
+
+      // World bounds
+      if (this.x < 0) this.x = 0;
+      if (this.x + this.w > WORLD.w) this.x = WORLD.w - this.w;
+      if (this.y + this.h > WORLD.h) { // fell off world: die
+        this.kill();
+      }
+
+      // Item pickups
+      for (const it of items) {
+        if (!it.taken && aabb(this, it)) {
+          it.taken = true;
+          if (it.type === 'doublejump') {
+            this.hasDouble = true;
+            this.jumpsLeft = Math.max(this.jumpsLeft, 2);
+          } else if (it.type === 'range') {
+            this.hasRangeUp = true;
+          }
+          refreshUI();
+        }
+      }
+
+      // Enemy collision
+      for (const e of enemies) {
+        if (!e.dead && aabb(this, e)) {
+          this.kill();
+          break;
+        }
+      }
+    }
+    kill() {
+      if (this.deadTimer > 0) return;
+      this.deadTimer = 1.2; // respawn delay
+      this.vx = 0; this.vy = 0;
+    }
+    respawn() {
+      this.x = this.spawnX;
+      this.y = this.spawnY;
+      this.vx = 0; this.vy = 0;
+      this.onGround = false;
+      this.resetForGround();
+      this.invuln = 1.5;
+    }
+    draw() {
+      const sx = Math.floor(this.x - VIEW.x);
+      const sy = Math.floor(this.y - VIEW.y);
+      // body
+      ctx.fillStyle = this.invuln > 0 ? '#9fdcff' : '#59c3ff';
+      ctx.fillRect(sx, sy, this.w, this.h);
+      ctx.strokeStyle = '#1a3c5a';
+      ctx.lineWidth = 2;
+      ctx.strokeRect(sx+0.5, sy+0.5, this.w-1, this.h-1);
+      // face direction "bow" hint
+      ctx.fillStyle = '#ffd35a';
+      if (this.dir > 0) ctx.fillRect(sx + this.w, sy + this.h/2 - 2, 6, 4);
+      else ctx.fillRect(sx - 6, sy + this.h/2 - 2, 6, 4);
+    }
+  }
+
+  // World content
+  const platforms = [];
+  const enemies = [];
+  const arrows = [];
+  const items = [];
+
+  function makeWorld() {
+    platforms.length = 0;
+    enemies.length = 0;
+    arrows.length = 0;
+    items.length = 0;
+
+    // Ground and terraces
+    platforms.push(new Platform(0, WORLD.h - 40, WORLD.w, 40));
+    // Vertical ascent platforms
+    // Left side ascent
+    let x = 100, y = WORLD.h - 220;
+    for (let i=0;i<5;i++) {
+      platforms.push(new Platform(x, y, 160, 20));
+      x += 180; y -= 160;
+    }
+    // Mid tower
+    platforms.push(new Platform(1050, WORLD.h - 420, 180, 20));
+    platforms.push(new Platform(1300, WORLD.h - 560, 160, 20));
+    platforms.push(new Platform(1550, WORLD.h - 720, 140, 20));
+    platforms.push(new Platform(1820, WORLD.h - 860, 200, 20));
+
+    // Right cliffs
+    platforms.push(new Platform(2300, WORLD.h - 300, 220, 20));
+    platforms.push(new Platform(2600, WORLD.h - 460, 140, 20));
+    platforms.push(new Platform(2800, WORLD.h - 620, 180, 20));
+    platforms.push(new Platform(3050, WORLD.h - 820, 240, 20));
+
+    // High floating islands
+    platforms.push(new Platform(900, WORLD.h - 1100, 200, 20));
+    platforms.push(new Platform(1250, WORLD.h - 1280, 180, 20));
+    platforms.push(new Platform(1600, WORLD.h - 1450, 200, 20));
+    platforms.push(new Platform(2000, WORLD.h - 1600, 220, 20));
+    platforms.push(new Platform(2400, WORLD.h - 1720, 200, 20));
+    platforms.push(new Platform(2800, WORLD.h - 1840, 200, 20));
+    platforms.push(new Platform(3200, WORLD.h - 1960, 260, 20));
+
+    // Place items
+    items.push(new Item('doublejump', 1820+90-11, WORLD.h - 860 - 22)); // feather
+    items.push(new Item('range', 3200+120-11, WORLD.h - 1960 - 22)); // quiver
+
+    // Enemies: mix patrol and walker
+    enemies.push(new Enemy('patrol', 300, WORLD.h - 40 - 26));
+    enemies.push(new Enemy('patrol', 600, WORLD.h - 220 - 26));
+    enemies.push(new Enemy('patrol', 1300, WORLD.h - 560 - 26));
+    enemies.push(new Enemy('patrol', 1820+50, WORLD.h - 860 - 26));
+    enemies.push(new Enemy('walker', 2400+60, WORLD.h - 1720 - 26));
+    enemies.push(new Enemy('walker', 2800+20, WORLD.h - 620 - 26));
+    enemies.push(new Enemy('walker', 3050+50, WORLD.h - 820 - 26));
+  }
+
+  // Game state
+  const player = new Player();
+  let kills = 0;
+  function refreshUI() {
+    uiKills.textContent = kills.toString();
+    uiDJ.textContent = player.hasDouble ? 'Yes' : 'No';
+    uiRange.textContent = player.hasRangeUp ? 'Long' : 'Short';
+  }
+
+  // Rain overlay (screen-space, non-interactive)
+  let rainOn = true;
+  let rainDrops = [];
+  function regenRain() {
+    const count = Math.floor((canvas.width * canvas.height) / 9000); // density
+    rainDrops = [];
+    for (let i=0;i<count;i++) {
+      rainDrops.push({
+        x: Math.random() * canvas.width,
+        y: Math.random() * canvas.height,
+        len: 10 + Math.random()*14,
+        spd: 300 + Math.random()*200,
+        drift: 80 + Math.random()*80
+      });
+    }
+  }
+  regenRain();
+  window.addEventListener('resize', regenRain);
+
+  function drawRain(dt) {
+    if (!rainOn) return;
+    ctx.save();
+    ctx.globalAlpha = 0.5;
+    ctx.strokeStyle = '#5aa0ff';
+    ctx.lineWidth = 1;
+    for (const d of rainDrops) {
+      const dx = d.drift * dt;
+      const dy = d.spd * dt;
+      d.x += dx; d.y += dy;
+      if (d.y > canvas.height + 10 || d.x > canvas.width + 10) {
+        d.x = Math.random() * canvas.width - 50;
+        d.y = -20;
+      }
+      ctx.beginPath();
+      ctx.moveTo(Math.floor(d.x), Math.floor(d.y));
+      ctx.lineTo(Math.floor(d.x - d.len*0.3), Math.floor(d.y - d.len));
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  // Input handling with debounced jump/shoot (respond only on keydown transition; ignore repeats)
+  window.addEventListener('keydown', (e) => {
+    const k = e.key;
+    if (e.repeat) {
+      // Do not process held repeats for jump/shoot; but mark movement keys
+      if (isLeftKey(k) || isRightKey(k)) keysDown.add(k.toLowerCase());
+      return;
+    }
+    const lower = k.length === 1 ? k.toLowerCase() : k;
+    if (isLeftKey(lower) || isRightKey(lower)) keysDown.add(lower);
+    if (isJumpKey(lower)) {
+      e.preventDefault();
+      player.tryJump(); // consume one jump per distinct keydown
+    }
+    if (isShootKey(lower)) {
+      e.preventDefault();
+      player.shoot();
+    }
+    if (lower === 'r') {
+      rainOn = !rainOn;
+    }
+  });
+  window.addEventListener('keyup', (e) => {
+    const lower = (e.key.length === 1 ? e.key.toLowerCase() : e.key);
+    keysDown.delete(lower);
+  });
+
+  // Camera follow
+  function updateCamera() {
+    VIEW.w = canvas.width; VIEW.h = canvas.height;
+    const targetX = player.x + player.w/2 - VIEW.w/2;
+    const targetY = player.y + player.h/2 - VIEW.h/2;
+    // simple snap (could smooth with lerp)
+    VIEW.x = Math.max(0, Math.min(WORLD.w - VIEW.w, Math.floor(targetX)));
+    VIEW.y = Math.max(0, Math.min(WORLD.h - VIEW.h, Math.floor(targetY)));
+  }
+
+  // Initialize world
+  makeWorld();
+  refreshUI();
+
+  // Timing
+  let last = performance.now();
+  function loop(now) {
+    requestAnimationFrame(loop);
+    let dt = (now - last) / 1000;
+    if (dt > 0.05) dt = 0.05; // clamp
+    last = now;
+
+    // Update
+    player.update(dt);
+
+    for (const e of enemies) e.update(dt);
+    for (const it of items) it.update(dt);
+    for (const a of arrows) a.update(dt);
+
+    // Arrow vs enemy
+    for (const a of arrows) {
+      if (a.dead) continue;
+      for (const e of enemies) {
+        if (e.dead) continue;
+        if (aabb(a, e)) {
+          e.dead = true;
+          a.dead = true;
+          kills++;
+          refreshUI();
+          break;
+        }
+      }
+    }
+
+    // Clean up dead entities
+    for (let i = arrows.length-1; i>=0; i--) if (arrows[i].dead) arrows.splice(i,1);
+    for (let i = enemies.length-1; i>=0; i--) if (enemies[i].dead) enemies.splice(i,1);
+
+    updateCamera();
+
+    // Draw
+    // Sky gradient already via CSS background; paint parallax stars faintly
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+    // distant backdrop hills (simple rectangles/strips for pixel art vibe)
+    ctx.fillStyle = '#0c1220';
+    for (let i=0;i<8;i++) {
+      const bx = ((i*600) - (VIEW.x * 0.2)) % (canvas.width + 600) - 300;
+      const by = canvas.height - 60 - (i%3)*10;
+      ctx.fillRect(Math.floor(bx), Math.floor(by), 400, 60 + (i%3)*10);
+    }
+
+    // Platforms
+    for (const p of platforms) p.draw();
+
+    // Items
+    for (const it of items) it.draw();
+
+    // Enemies
+    for (const e of enemies) e.draw();
+
+    // Arrows
+    for (const a of arrows) a.draw();
+
+    // Player
+    player.draw();
+
+    // Foreground vignette
+    ctx.fillStyle = 'rgba(0,0,0,0.17)';
+    ctx.fillRect(0, 0, canvas.width, 12);
+    ctx.fillRect(0, canvas.height-12, canvas.width, 12);
+
+    // Rain overlay last
+    drawRain(dt);
+  }
+  requestAnimationFrame(loop);
+
+  // Optional: restart with Enter if player dead
+  window.addEventListener('keydown', (e) => {
+    if ((e.key === 'Enter' || e.key === 'Return') && player.deadTimer > 0) {
+      player.deadTimer = 0; player.respawn();
+    }
+  });
+
+})();
+</script>
+</body>
+</html>
