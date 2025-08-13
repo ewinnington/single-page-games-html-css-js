@@ -1,0 +1,672 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>TetrOut — Tetris -> Breakout</title>
+  <style>
+    html, body {
+      height: 100%;
+      margin: 0;
+      background: radial-gradient(1200px 800px at 50% 20%, #0c1022, #060912 70%, #04060c);
+      color: #e8f1ff;
+      font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+      overflow: hidden;
+      user-select: none;
+    }
+    #wrap {
+      position: absolute; inset: 0;
+      display: grid; place-items: center;
+    }
+    canvas {
+      image-rendering: pixelated;
+      border-radius: 12px;
+      box-shadow:
+        0 20px 60px rgba(0, 0, 0, 0.55),
+        0 0 0 1px rgba(255,255,255,0.05),
+        0 0 80px rgba(35, 120, 255, 0.25) inset;
+      background: linear-gradient(180deg, rgba(6,10,18,0.85), rgba(6,10,18,0.95));
+    }
+    .hud {
+      position: absolute; top: 14px; left: 50%; transform: translateX(-50%);
+      display: flex; gap: 14px; align-items: center;
+      background: rgba(10,14,22,0.6);
+      border: 1px solid rgba(255,255,255,0.05);
+      padding: 8px 12px; border-radius: 10px;
+      backdrop-filter: blur(6px);
+      box-shadow: 0 8px 24px rgba(0,0,0,0.25);
+      pointer-events: none;
+    }
+    .chip { padding: 2px 8px; border-radius: 999px; background: rgba(255,255,255,0.06); }
+    .chip b { color: #7dd3fc; }
+    .title { letter-spacing: 0.5px; color: #93c5fd; text-shadow: 0 0 12px rgba(56,189,248,0.35); }
+    .hint { position: absolute; bottom: 10px; left: 50%; transform: translateX(-50%); opacity: 0.75; font-size: 12px; }
+    a { color: #93c5fd; text-decoration: none; }
+  </style>
+  <!--
+    TetrOut — A single-file canvas game
+    Phase 1: Tetris (no line clears). A thin red line marks the breakout zone below
+    which tetrominoes cannot occupy.
+    Phase 2: Breakout. The stacked tetromino squares become bricks; paddle + balls
+    break them. Clearing a full row in Breakout spawns an extra ball. When all
+    bricks are destroyed, advance level, ramp speed, and return to Tetris.
+  -->
+  
+  <div class="hud" id="hud">
+    <span class="title">TetrOut</span>
+    <span class="chip">Score: <b id="score">0</b></span>
+    <span class="chip">Level: <b id="level">1</b></span>
+    <span class="chip">Phase: <b id="phase">TETRIS</b></span>
+  </div>
+  <div id="wrap">
+    <canvas id="game" width="540" height="840"></canvas>
+  </div>
+  <div class="hint">Controls — Tetris: arrows to move/rotate, space to drop. Breakout: drag mouse or use arrows. Press R to restart.</div>
+</head>
+<body>
+  <script>
+    ;(() => {
+      const canvas = document.getElementById('game');
+      const ctx = canvas.getContext('2d');
+      const hudScore = document.getElementById('score');
+      const hudLevel = document.getElementById('level');
+      const hudPhase = document.getElementById('phase');
+
+      // Layout and scaling
+      const COLS = 10;
+      const ROWS = 20; // bricks zone height
+      const PADDLE_ZONE = 74; // px below the red line
+      const HUD_ZONE = 0; // keep 0, external HUD div used
+      let cell = 28; // computed on resize
+      const BORDER = 10; // inner padding
+
+      const WORLD = {
+        width: () => COLS * cell + BORDER * 2,
+        height: () => ROWS * cell + PADDLE_ZONE + HUD_ZONE + BORDER * 2,
+        redLineY: () => BORDER + ROWS * cell, // y px of the thin red line
+        gridX: () => BORDER,
+        gridY: () => BORDER,
+        paddleY: () => BORDER + ROWS * cell + (PADDLE_ZONE - 20), // paddle baseline
+      }
+
+      function fitToWindow() {
+        const maxW = Math.min(window.innerWidth - 24, 720);
+        cell = Math.floor(Math.max(20, Math.min(36, (maxW - BORDER * 2) / COLS)));
+        canvas.width = WORLD.width();
+        canvas.height = WORLD.height();
+      }
+      fitToWindow();
+      window.addEventListener('resize', fitToWindow);
+
+      // Game State
+      const PHASE = { TETRIS: 'TETRIS', BREAKOUT: 'BREAKOUT' };
+      let phase = PHASE.TETRIS;
+      let score = 0;
+      let level = 1;
+      function speedMul() { return 1 + (level - 1) * 0.12; }
+      function addScore(n) { score = Math.max(0, score + n); hudScore.textContent = score; }
+      function setPhase(p) { phase = p; hudPhase.textContent = p; }
+      function setLevel(l) { level = l; hudLevel.textContent = l; }
+
+      // Grid
+      function newGrid() { return Array.from({length: ROWS}, () => Array(COLS).fill(null)); }
+      let grid = newGrid();
+
+      // Visuals
+      function hueFor(id) { return (id * 53) % 360; }
+      function blockColor(id) { const h = hueFor(id); return `hsl(${h} 80% 60%)`; }
+      function blockGlow(id) { const h = hueFor(id); return `hsl(${h} 90% 70% / 0.7)`; }
+      function drawRoundedRect(x, y, w, h, r) {
+        const rr = Math.min(r, w/2, h/2);
+        ctx.beginPath();
+        ctx.moveTo(x+rr, y);
+        ctx.arcTo(x+w, y, x+w, y+h, rr);
+        ctx.arcTo(x+w, y+h, x, y+h, rr);
+        ctx.arcTo(x, y+h, x, y, rr);
+        ctx.arcTo(x, y, x+w, y, rr);
+        ctx.closePath();
+      }
+
+      // Particles
+      const particles = [];
+      function spawnBurst(px, py, color) {
+        for (let i = 0; i < 10; i++) {
+          const a = Math.random() * Math.PI * 2;
+          const s = 60 + Math.random() * 140;
+          particles.push({
+            x: px, y: py, vx: Math.cos(a) * s, vy: Math.sin(a) * s,
+            life: 0.4 + Math.random() * 0.4, age: 0, color
+          });
+        }
+      }
+
+      // Screen shake
+      let shakeT = 0, shakeMag = 0;
+      function addShake(mag, t=0.15) { shakeMag = Math.max(shakeMag, mag); shakeT = Math.max(shakeT, t); }
+      function applyShake(dt) { if (shakeT > 0) shakeT -= dt; }
+      function getShakeOffset() {
+        if (shakeT <= 0) return {x: 0, y: 0};
+        const f = (shakeT);
+        return { x: (Math.random()*2-1) * shakeMag * f * 3, y: (Math.random()*2-1) * shakeMag * f * 3 };
+      }
+
+      // Tetris pieces
+      const SHAPES = [
+        // I
+        { id: 1, m: [ [1,1,1,1] ] },
+        // J
+        { id: 2, m: [ [1,0,0], [1,1,1] ] },
+        // L
+        { id: 3, m: [ [0,0,1], [1,1,1] ] },
+        // O
+        { id: 4, m: [ [1,1], [1,1] ] },
+        // S
+        { id: 5, m: [ [0,1,1], [1,1,0] ] },
+        // T
+        { id: 6, m: [ [0,1,0], [1,1,1] ] },
+        // Z
+        { id: 7, m: [ [1,1,0], [0,1,1] ] },
+      ];
+
+      function rotateMatrix(m) {
+        const h = m.length, w = m[0].length;
+        const r = Array.from({length: w}, () => Array(h).fill(0));
+        for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) r[x][h-1-y] = m[y][x];
+        return r;
+      }
+
+      function cloneMatrix(m){ return m.map(row => row.slice()); }
+
+      const tetris = {
+        cur: null,
+        x: 0, y: 0,
+        m: null, id: 0,
+        dropTimer: 0,
+        dropInt: () => 0.8 / speedMul(),
+      };
+
+      function spawnPiece() {
+        const base = SHAPES[(Math.random() * SHAPES.length)|0];
+        tetris.m = cloneMatrix(base.m);
+        tetris.id = base.id + Math.floor(Math.random()*8)*7; // widen color variety
+        tetris.y = -2; // start above board
+        tetris.x = ((COLS - tetris.m[0].length) / 2) | 0;
+        if (collides(tetris.m, tetris.x, tetris.y)) {
+          // If cannot spawn, go to breakout
+          enterBreakout();
+        }
+      }
+
+      function collides(m, ox, oy) {
+        for (let y = 0; y < m.length; y++) {
+          for (let x = 0; x < m[0].length; x++) {
+            if (!m[y][x]) continue;
+            const gx = ox + x;
+            const gy = oy + y;
+            if (gx < 0 || gx >= COLS || gy >= ROWS) return true; // red line is bottom
+            if (gy >= 0 && grid[gy][gx]) return true;
+          }
+        }
+        return false;
+      }
+
+      function mergePiece() {
+        const m = tetris.m, ox = tetris.x, oy = tetris.y;
+        for (let y = 0; y < m.length; y++) for (let x = 0; x < m[0].length; x++) if (m[y][x]) {
+          const gx = ox + x, gy = oy + y;
+          if (gy >= 0 && gy < ROWS && gx >= 0 && gx < COLS) grid[gy][gx] = tetris.id;
+        }
+      }
+
+      // Breakout state
+      const breakout = {
+        bricks: null, // shared with grid (boolean truthy id)
+        rowCounts: null, // for detecting row clears
+        balls: [],
+        paddle: { x: 0, y: 0, w: 0, h: 12, vx: 0 },
+        serveCooldown: 0,
+      };
+
+      function resetBreakoutFromGrid() {
+        breakout.bricks = grid.map(row => row.slice());
+        breakout.rowCounts = breakout.bricks.map(r => r.reduce((a,b)=>a + (b?1:0), 0));
+        breakout.balls = [];
+        breakout.serveCooldown = 0.75;
+        const pw = Math.max(64, Math.min(200, cell * 3.0));
+        breakout.paddle.w = pw; breakout.paddle.h = Math.max(10, Math.floor(cell * 0.45));
+        breakout.paddle.y = WORLD.paddleY() - breakout.paddle.h - 8;
+        breakout.paddle.x = (canvas.width - breakout.paddle.w) / 2;
+        breakout.paddle.vx = 0;
+      }
+
+      function ballsAlive() { return breakout.balls.length > 0; }
+      function anyBricksLeft() { return breakout.rowCounts.some(c => c > 0); }
+
+      function enterBreakout() {
+        setPhase(PHASE.BREAKOUT);
+        resetBreakoutFromGrid();
+        // serve initial ball
+        spawnBall();
+      }
+
+      function spawnBall() {
+        const bSpeed = 260 * speedMul();
+        const angle = (-Math.PI/3) + Math.random() * (Math.PI/3); // upwards
+        breakout.balls.push({
+          x: canvas.width/2, y: WORLD.redLineY() + (PADDLE_ZONE * 0.55),
+          r: Math.max(5, Math.floor(cell * 0.22)),
+          vx: Math.cos(angle) * bSpeed,
+          vy: -Math.abs(Math.sin(angle) * bSpeed),
+          trail: [],
+        });
+      }
+
+      // Input
+      const keys = new Set();
+      // Debounced Tetris key repeat (DAS/ARR style)
+      const tInput = (() => {
+        const make = (initial, interval) => ({ down: false, since: 0, wait: initial, initial, interval, queued: false });
+        const reps = {
+          ArrowLeft: make(150, 75),
+          ArrowRight: make(150, 75),
+          ArrowDown: make(0, 55),
+          ArrowUp: make(200, 200), // rotate slower
+        };
+        return {
+          onKeyDown(k){ const r = reps[k]; if (r && !r.down){ r.down = true; r.queued = true; r.since = 0; r.wait = r.initial; } },
+          onKeyUp(k){ const r = reps[k]; if (r){ r.down = false; r.queued = false; r.since = 0; r.wait = r.initial; } },
+          consume(dt){
+            const out = [];
+            for (const [k,r] of Object.entries(reps)){
+              if (!r.down) continue;
+              if (r.queued){ out.push(k); r.queued = false; r.since = 0; continue; }
+              r.since += dt * 1000;
+              if (r.since >= r.wait){ out.push(k); r.since -= r.wait; r.wait = r.interval; }
+            }
+            return out;
+          }
+        };
+      })();
+
+      window.addEventListener('keydown', (e) => {
+        if (['ArrowLeft','ArrowRight','ArrowUp','ArrowDown',' '].includes(e.key)) e.preventDefault();
+        keys.add(e.key);
+        // Hook debounced Tetris input
+        tInput.onKeyDown(e.key);
+        // Hard drop once per press
+        if (phase === PHASE.TETRIS && e.key === ' ') hardDrop();
+        if (e.key.toLowerCase() === 'r') restart();
+      });
+      window.addEventListener('keyup', (e) => { keys.delete(e.key); tInput.onKeyUp(e.key); });
+
+      // Mouse drag for paddle
+      let dragging = false;
+      canvas.addEventListener('mousedown', (e) => {
+        dragging = true;
+      });
+      window.addEventListener('mouseup', ()=> dragging = false);
+      window.addEventListener('mousemove', (e) => {
+        if (!dragging || phase !== PHASE.BREAKOUT) return;
+        const rect = canvas.getBoundingClientRect();
+        const mx = e.clientX - rect.left;
+        setPaddleX(mx - breakout.paddle.w/2);
+      });
+
+      function setPaddleX(x) {
+        breakout.paddle.x = Math.max(BORDER, Math.min(canvas.width - BORDER - breakout.paddle.w, x));
+      }
+
+      function restart() {
+        grid = newGrid();
+        setLevel(1); score = 0; hudScore.textContent = '0';
+        setPhase(PHASE.TETRIS);
+        particles.length = 0; breakout.balls = [];
+        spawnPiece();
+      }
+
+      // Tetris controls (debounced)
+      function tetrisControls(dt) {
+        const actions = tInput.consume(dt);
+        for (const a of actions) {
+          if (a === 'ArrowLeft') tryMove(-1, 0);
+          else if (a === 'ArrowRight') tryMove(1, 0);
+          else if (a === 'ArrowUp') tryRotate();
+          else if (a === 'ArrowDown') softDrop();
+        }
+      }
+
+      function tryMove(dx, dy) {
+        const nx = tetris.x + dx, ny = tetris.y + dy;
+        if (!collides(tetris.m, nx, ny)) { tetris.x = nx; tetris.y = ny; }
+      }
+      function tryRotate() {
+        const rm = rotateMatrix(tetris.m);
+        if (!collides(rm, tetris.x, tetris.y)) { tetris.m = rm; return; }
+        // basic wall-kick
+        if (!collides(rm, tetris.x - 1, tetris.y)) { tetris.x -= 1; tetris.m = rm; return; }
+        if (!collides(rm, tetris.x + 1, tetris.y)) { tetris.x += 1; tetris.m = rm; return; }
+      }
+      function softDrop() {
+        if (!collides(tetris.m, tetris.x, tetris.y + 1)) tetris.y += 1;
+      }
+      function hardDrop() {
+        while (!collides(tetris.m, tetris.x, tetris.y + 1)) tetris.y += 1;
+        lockPiece();
+      }
+
+      function lockPiece() {
+        mergePiece();
+        addShake(0.2, 0.12);
+        // No row clears in Tetris phase by design
+        // Detect if we touched the top (any block in row 0)
+        const reachedTop = grid[0].some(Boolean);
+        if (reachedTop) {
+          enterBreakout();
+          return;
+        }
+        spawnPiece();
+      }
+
+      function updateTetris(dt) {
+        tetris.dropTimer += dt;
+        if (tetris.dropTimer >= tetris.dropInt()) {
+          tetris.dropTimer = 0;
+          if (!collides(tetris.m, tetris.x, tetris.y + 1)) {
+            tetris.y += 1;
+          } else {
+            lockPiece();
+          }
+        }
+      }
+
+      function drawTetris() {
+        // Draw existing blocks
+        for (let y = 0; y < ROWS; y++) {
+          for (let x = 0; x < COLS; x++) {
+            const id = grid[y][x];
+            if (!id) continue;
+            drawCell(x, y, id, 1);
+          }
+        }
+        // Draw current piece + ghost
+        if (tetris.m) {
+          // ghost
+          let gy = tetris.y;
+          while (!collides(tetris.m, tetris.x, gy + 1)) gy++;
+          drawPiece(tetris.x, gy, tetris.m, tetris.id, 0.23);
+          drawPiece(tetris.x, tetris.y, tetris.m, tetris.id, 1.0);
+        }
+      }
+
+      function drawPiece(px, py, m, id, alpha=1) {
+        const h = m.length, w = m[0].length;
+        for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) if (m[y][x]) drawCell(px + x, py + y, id, alpha);
+      }
+
+      function drawCell(gx, gy, id, alpha=1) {
+        if (gy < 0) return;
+        const x = WORLD.gridX() + gx * cell + 1;
+        const y = WORLD.gridY() + gy * cell + 1;
+        const sz = cell - 2;
+        const grad = ctx.createLinearGradient(x, y, x + sz, y + sz);
+        grad.addColorStop(0, blockColor(id));
+        grad.addColorStop(1, 'hsl(220 20% 12%)');
+        ctx.save();
+        ctx.globalAlpha = alpha;
+        ctx.shadowColor = blockGlow(id);
+        ctx.shadowBlur = 18;
+        drawRoundedRect(x, y, sz, sz, Math.max(4, cell*0.18));
+        ctx.fillStyle = grad;
+        ctx.fill();
+        ctx.restore();
+        // inner shine
+        ctx.save();
+        ctx.globalAlpha = alpha * 0.6;
+        drawRoundedRect(x+3, y+3, sz-6, sz-6, Math.max(3, cell*0.12));
+        ctx.strokeStyle = 'rgba(255,255,255,0.08)';
+        ctx.stroke();
+        ctx.restore();
+      }
+
+      // Breakout logic
+      function updateBreakout(dt) {
+        // paddle control
+        const accel = 1800, friction = 0.85;
+        if (keys.has('ArrowLeft') || keys.has('a')) breakout.paddle.vx -= accel * dt;
+        if (keys.has('ArrowRight') || keys.has('d')) breakout.paddle.vx += accel * dt;
+        breakout.paddle.vx *= friction;
+        setPaddleX(breakout.paddle.x + breakout.paddle.vx * dt);
+
+        // balls
+        for (const b of breakout.balls) {
+          // trail
+          b.trail.push({x: b.x, y: b.y, a: 1});
+          if (b.trail.length > 12) b.trail.shift();
+          // move
+          b.x += b.vx * dt; b.y += b.vy * dt;
+          // walls
+          if (b.x - b.r < BORDER) { b.x = BORDER + b.r; b.vx *= -1; }
+          if (b.x + b.r > canvas.width - BORDER) { b.x = canvas.width - BORDER - b.r; b.vx *= -1; }
+          // top
+          if (b.y - b.r < BORDER) { b.y = BORDER + b.r; b.vy *= -1; }
+          // red line is not a wall in breakout; it's the top of paddle zone
+
+          // paddle
+          const p = breakout.paddle;
+          if (b.y + b.r >= p.y && b.y - b.r <= p.y + p.h && b.x >= p.x && b.x <= p.x + p.w && b.vy > 0) {
+            // reflect with angle based on hit position
+            b.y = p.y - b.r - 0.1;
+            const hit = ((b.x - p.x) / p.w) - 0.5; // -0.5..0.5
+            const maxAngle = Math.PI * 0.4;
+            const speed = Math.hypot(b.vx, b.vy) * 1.005; // tiny speed up
+            const ang = -Math.PI/2 + hit * 2 * maxAngle;
+            b.vx = Math.cos(ang) * speed;
+            b.vy = Math.sin(ang) * speed;
+            addShake(0.2, 0.06);
+          }
+        }
+
+        // bricks collision — grid space
+        // Convert each ball to grid cells candidate AABB
+        for (const b of breakout.balls) {
+          // bottom out
+          if (b.y - b.r > canvas.height + 40) { b.dead = true; continue; }
+          const minGX = Math.max(0, Math.floor((b.x - b.r - WORLD.gridX()) / cell));
+          const maxGX = Math.min(COLS-1, Math.floor((b.x + b.r - WORLD.gridX()) / cell));
+          const minGY = Math.max(0, Math.floor((b.y - b.r - WORLD.gridY()) / cell));
+          const maxGY = Math.min(ROWS-1, Math.floor((b.y + b.r - WORLD.gridY()) / cell));
+          let hitAny = false;
+          for (let gy = minGY; gy <= maxGY; gy++) {
+            for (let gx = minGX; gx <= maxGX; gx++) {
+              const id = breakout.bricks[gy][gx];
+              if (!id) continue;
+              // block bounds
+              const bx = WORLD.gridX() + gx * cell;
+              const by = WORLD.gridY() + gy * cell;
+              // circle-rect collision resolve
+              const nearestX = Math.max(bx, Math.min(bx + cell, b.x));
+              const nearestY = Math.max(by, Math.min(by + cell, b.y));
+              const distX = b.x - nearestX;
+              const distY = b.y - nearestY;
+              if (distX*distX + distY*distY <= b.r*b.r + 0.001) {
+                // decide reflect axis by comparing penetration along x and y
+                const overlapX = Math.min(Math.abs((b.x + b.r) - bx), Math.abs((bx + cell) - (b.x - b.r)));
+                const overlapY = Math.min(Math.abs((b.y + b.r) - by), Math.abs((by + cell) - (b.y - b.r)));
+                if (overlapX < overlapY) { b.vx *= -1; } else { b.vy *= -1; }
+                // remove brick, score, particles
+                breakout.bricks[gy][gx] = null;
+                breakout.rowCounts[gy]--;
+                addScore(10);
+                hitAny = true;
+                const cx = bx + cell/2, cy = by + cell/2;
+                spawnBurst(cx, cy, blockColor(id));
+                // row clear check
+                if (breakout.rowCounts[gy] === 0) {
+                  addScore(100);
+                  addShake(0.6, 0.2);
+                  spawnBall();
+                }
+              }
+            }
+          }
+          if (hitAny) {
+            // small speed ramp per hit
+            const s = Math.hypot(b.vx, b.vy) * (1 + 0.002 * speedMul());
+            const a = Math.atan2(b.vy, b.vx);
+            b.vx = Math.cos(a) * s; b.vy = Math.sin(a) * s;
+          }
+        }
+        // remove dead balls
+        breakout.balls = breakout.balls.filter(b => !b.dead);
+
+        // respawn if needed
+        if (!ballsAlive() && anyBricksLeft()) {
+          breakout.serveCooldown -= dt;
+          if (breakout.serveCooldown <= 0) {
+            breakout.serveCooldown = 1.2;
+            spawnBall();
+          }
+        }
+
+        // all cleared -> next level, back to tetris
+        if (!anyBricksLeft()) {
+          addScore(500);
+          setLevel(level + 1);
+          grid = newGrid();
+          setPhase(PHASE.TETRIS);
+          particles.length = 0;
+          spawnPiece();
+        }
+      }
+
+      function drawBreakout() {
+        // bricks
+        for (let y = 0; y < ROWS; y++) {
+          for (let x = 0; x < COLS; x++) {
+            const id = breakout.bricks[y][x];
+            if (!id) continue;
+            drawCell(x, y, id, 1);
+          }
+        }
+        // paddle
+        const p = breakout.paddle;
+        ctx.save();
+        ctx.shadowColor = 'rgba(80,200,255,0.7)';
+        ctx.shadowBlur = 25;
+        drawRoundedRect(p.x, p.y, p.w, p.h, 8);
+        const pg = ctx.createLinearGradient(p.x, p.y, p.x+p.w, p.y+p.h);
+        pg.addColorStop(0, 'hsl(200 95% 60%)');
+        pg.addColorStop(1, 'hsl(260 95% 60%)');
+        ctx.fillStyle = pg;
+        ctx.fill();
+        ctx.restore();
+        // balls + trails
+        for (const b of breakout.balls) {
+          for (let i = 0; i < b.trail.length; i++) {
+            const t = b.trail[i];
+            const a = (i + 1) / b.trail.length;
+            ctx.beginPath();
+            ctx.fillStyle = `hsla(${220 + a*80} 90% 70% / ${0.14*a})`;
+            ctx.arc(t.x, t.y, b.r * (0.6 + a*0.5), 0, Math.PI*2);
+            ctx.fill();
+          }
+          ctx.save();
+          ctx.shadowColor = 'rgba(180,220,255,0.8)';
+          ctx.shadowBlur = 18;
+          ctx.beginPath();
+          ctx.fillStyle = 'white';
+          ctx.arc(b.x, b.y, b.r, 0, Math.PI*2);
+          ctx.fill();
+          ctx.restore();
+        }
+      }
+
+      // Render common
+      function drawBackdrop() {
+        // board outline
+        const {x:ox,y:oy} = getShakeOffset();
+        ctx.save();
+        ctx.translate(ox, oy);
+        // outer border
+        drawRoundedRect(6, 6, canvas.width-12, canvas.height-12, 16);
+        ctx.strokeStyle = 'rgba(180,200,255,0.06)';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+        // grid bg
+        drawRoundedRect(WORLD.gridX()-4, WORLD.gridY()-4, COLS*cell+8, ROWS*cell+8, 10);
+        ctx.fillStyle = 'rgba(255,255,255,0.02)';
+        ctx.fill();
+        // subtle scanlines
+        ctx.globalAlpha = 0.05;
+        for (let y = WORLD.gridY(); y <= WORLD.gridY() + ROWS * cell; y += 2) {
+          ctx.fillStyle = '#000';
+          ctx.fillRect(WORLD.gridX(), y, COLS*cell, 1);
+        }
+        ctx.globalAlpha = 1;
+        // red line
+        ctx.beginPath();
+        ctx.moveTo(BORDER, WORLD.redLineY()+0.5);
+        ctx.lineTo(canvas.width - BORDER, WORLD.redLineY()+0.5);
+        ctx.strokeStyle = 'rgba(255,60,60,0.9)';
+        ctx.lineWidth = 2;
+        ctx.setLineDash([8,6]);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        // paddle zone glow
+        const lg = ctx.createLinearGradient(0, WORLD.redLineY(), 0, WORLD.redLineY()+PADDLE_ZONE);
+        lg.addColorStop(0, 'rgba(255,60,60,0.07)');
+        lg.addColorStop(1, 'rgba(56,189,248,0.06)');
+        ctx.fillStyle = lg;
+        ctx.fillRect(BORDER, WORLD.redLineY(), canvas.width - BORDER*2, PADDLE_ZONE);
+        ctx.restore();
+      }
+
+      function drawParticles(dt) {
+        for (let i = particles.length - 1; i >= 0; i--) {
+          const p = particles[i];
+          p.age += dt; if (p.age > p.life) { particles.splice(i,1); continue; }
+          const k = p.age / p.life;
+          p.x += p.vx * dt; p.y += p.vy * dt;
+          p.vy += 380 * dt; // gravity
+          ctx.globalAlpha = 1 - k;
+          ctx.fillStyle = p.color;
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, Math.max(1.5, 3 - 1.2*k), 0, Math.PI*2);
+          ctx.fill();
+          ctx.globalAlpha = 1;
+        }
+      }
+
+      // Main loop
+      let last = performance.now();
+      function loop(now) {
+        const dt = Math.min(0.033, (now - last) / 1000);
+        last = now;
+        applyShake(dt);
+        // Update
+        if (phase === PHASE.TETRIS) {
+          if (!tetris.m) spawnPiece();
+          tetrisControls(dt);
+          updateTetris(dt);
+        } else {
+          updateBreakout(dt);
+        }
+        // Draw
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        drawBackdrop();
+        if (phase === PHASE.TETRIS) {
+          drawTetris();
+        } else {
+          drawBreakout();
+        }
+        drawParticles(dt);
+        requestAnimationFrame(loop);
+      }
+      requestAnimationFrame(loop);
+
+      // Initialize
+      restart();
+    })();
+  </script>
+</body>
+</html>
